@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-🏇 自分専用 競馬予想AI（v5）× 展開・血統 + 過去データ一括入力機能
+🏇 自分専用 競馬予想AI（v5）× 展開・血統・上がり3F ＋ 過去データ一括入力機能
 """
 import csv
 import pickle
@@ -16,20 +16,21 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 
 st.set_page_config(page_title="競馬予想AI v5", page_icon="🏇", layout="centered")
-st.title("🏇 競馬予想AI v5")
+st.title("🏇 競馬予想AI v5（上がり3F対応版）")
 
 MODEL_PATH = Path(__file__).parent / "model.pkl"
 JST = timezone(timedelta(hours=9))
 
+# 拡張された基本特徴量（Last 3F を追加）
 STD_COLS = [
     "Bracket", "Horse Number", "Horse Name", "Sex", "Horse Age",
     "Burden Weight", "Jockey", "Trainer", "Sire", "Tactics",
-    "Total Prize", "Last Placing", "Last Time",
+    "Total Prize", "Last Placing", "Last Time", "Last 3F",
 ]
 NUM_DEFAULTS = {
     "Bracket": 0, "Horse Number": 0, "Horse Age": 4, "Burden Weight": 55,
     "Total Prize": 0, "Last Placing": "median:9", "Last Time": "mean:90",
-    "Distance": 0,
+    "Last 3F": 35.0, "Distance": 0,
 }
 STR_COLS = ["Horse Name", "Sex", "Jockey", "Trainer", "Sire",
             "Venue", "Track Condition", "Weather"]
@@ -41,10 +42,11 @@ DISTANCES = sorted(set(list(range(1000, 3700, 200)) + [1150, 1700, 1800, 2100, 2
 TRACKS = ["良", "稍重", "重", "不良"]
 WEATHERS = ["晴", "曇", "小雨", "雨", "雪"]
 
+# スプレッドシート保存用ログ列（全20列の標準フォーマット）
 LOG_COLS = [
     "Execution Date", "Race Day", "Race Name", "Venue", "Distance",
     "Track Condition", "Weather", "Bracket", "Horse Number", "Horse Name",
-    "Sex", "Horse Age", "Burden Weight", "Jockey", "Trainer", "Tactics",
+    "Sex", "Horse Age", "Burden Weight", "Jockey", "Trainer", "Tactics", "Last 3F",
     "AI_Probability", "AI_Rank", "Placing",
 ]
 
@@ -168,7 +170,7 @@ def parse_csv(text: str) -> pd.DataFrame:
         rows = rows[1:]
     else:
         if len(rows[0]) < len(STD_COLS):
-            raise ValueError("列数が足りません。13列（Bracket〜Last Time）のCSVを貼り付けてください。")
+            raise ValueError(f"列数が足りません。{len(STD_COLS)}列（Bracket〜Last 3F）のCSV/TSVを貼り付けてください。")
         header = list(STD_COLS)
 
     ncols = len(header)
@@ -246,7 +248,7 @@ def preprocess(df: pd.DataFrame, venue, distance, track, weather) -> pd.DataFram
     df["Weather"] = weather
 
     for c in NUM_DEFAULTS:
-        if c == "Last Time":
+        if c in ("Last Time", "Last 3F"):
             arr = np.array([parse_time(v) for v in df[c]], dtype=float)
         else:
             arr = to_float_array(df[c])
@@ -353,7 +355,7 @@ def render_pace(p: dict, out: pd.DataFrame):
 DEFAULT_FEATURES = [
     "Venue", "Distance", "Track Condition", "Weather", "Bracket", "Horse Number",
     "Sex", "Horse Age", "Burden Weight", "Jockey", "Trainer", "Sire", "Tactics",
-    "Total Prize", "Last Placing", "Last Time",
+    "Total Prize", "Last Placing", "Last Time", "Last 3F",
 ]
 
 
@@ -517,6 +519,7 @@ def build_log(df, proba, now, race_day, race_name, venue, distance, track, weath
         "Jockey": df["Jockey"].values,
         "Trainer": df["Trainer"].values,
         "Tactics": pd.array([int(x) if pd.notna(x) else pd.NA for x in df["TacticsCode"]], dtype="Int64"),
+        "Last 3F": df["Last 3F"].astype(float).values,
         "AI_Probability": prob,
         "AI_Rank": rank,
         "Placing": [None] * n,
@@ -796,11 +799,11 @@ def render_history_tab():
 
 
 # ------------------------------------------------------------------
-# タブ 2: 過去データ一括入力（新機能追加）
+# タブ 2: 過去データ一括入力（20列フォーマット対応）
 # ------------------------------------------------------------------
 def render_input_tab():
-    st.subheader("📥 過去レース結果データ 一括登録")
-    st.caption("AIプロンプト等で作成したタブ区切り（TSV）またはカンマ区切り（CSV）テキストを貼り付けて、スプレッドシートへ直接一括書き込み（追記）します。")
+    st.subheader("📥 過去レース結果データ 一括登録（上がり3F対応）")
+    st.caption("上がり3F（`Last 3F`）を含む20列フォーマットのタブ区切り（TSV）またはカンマ区切り（CSV）テキストを貼り付けて、スプレッドシートへ一括書き込みします。")
 
     raw_text = st.text_area(
         "データテキストを貼り付けてください",
@@ -816,7 +819,6 @@ def render_input_tab():
             df_in = pd.read_csv(StringIO(raw_text), sep=sep, dtype=str)
             df_in = _clean_columns(df_in)
 
-            # 不足列（19列フォーマット）の補填と並べ替え
             for col in LOG_COLS:
                 if col not in df_in.columns:
                     df_in[col] = None
@@ -831,14 +833,14 @@ def render_input_tab():
                 with st.spinner("スプレッドシートへ追記中…"):
                     try:
                         append_to_sheet(df_in)
-                        st.session_state.pop("history_df", None)  # 履歴キャッシュの更新
+                        st.session_state.pop("history_df", None)
                         st.balloons()
-                        st.success(f"🎉 正常に {len(df_in)} 件の過去データを追加しました！「📚 過去ログ＆的中率確認」タブで閲覧できます。")
+                        st.success(f"🎉 正常に {len(df_in)} 件の過去データを追加しました！")
                     except Exception as e:
                         st.error(f"スプレッドシート書き込み中にエラーが発生しました: {e}")
 
         except Exception as e:
-            st.warning(f"データの解析に失敗しました。フォーマット（TSV/CSV）を確認してください: {e}")
+            st.warning(f"データの解析に失敗しました。フォーマットを確認してください: {e}")
 
 
 # ------------------------------------------------------------------
@@ -874,12 +876,12 @@ with tab_run:
     race_name = st.text_input("レース名（任意・記録用）", placeholder="例：菊花賞")
     race_day = st.date_input("レース開催日（記録用）", value=datetime.now(JST).date())
 
-    st.subheader("② 出馬表を貼り付け")
+    st.subheader("② 出馬表を貼り付け（Last 3F 含む）")
     csv_text = st.text_area(
         "出馬表CSV",
         height=320,
         label_visibility="collapsed",
-        placeholder="ここに整形したCSVデータを貼り付けてください",
+        placeholder="Bracket\tHorse Number\tHorse Name\t...\tLast 3F\n1\t1\tサンプル馬A\t...\t33.8",
     )
 
     run = st.button("🔮 AI予想を実行する", type="primary", use_container_width=True)
