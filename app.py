@@ -444,8 +444,9 @@ if run:
                 st.session_state["saved"] = False
 
         except Exception as e:
-            st.session_state.pop("result", None)
-            st.error(f"予想中にエラーが発生しました: {e}")
+    st.session_state.pop("result", None)
+    st.error(f"予想中にエラーが発生しました: {e}")
+    st.code(traceback.format_exc())
 
 # 🔮 画面への最終結果出力エリア
 if "result" in st.session_state:
