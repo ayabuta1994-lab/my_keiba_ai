@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+lightgbm
+scikit-learn
+st-gsheets-connection
