@@ -21,6 +21,7 @@ Streamlit Cloud の Secrets（Settings > Secrets）に以下を設定:
 
 スプレッドシートに "predictions" シートを作り、サービスアカウントのメールを「編集者」で共有してください。
 """
+import csv
 import pickle
 import re
 import zlib
@@ -173,31 +174,44 @@ def get_feature_names(model, meta):
 # 入力データの解析・補正
 # ------------------------------------------------------------------
 def parse_csv(text: str) -> pd.DataFrame:
-    text = text.strip()
     text = text.replace("```csv", "").replace("```", "").replace("\u3000", " ").strip()
     if not text:
         raise ValueError("出馬表が空です。")
-    first = text.splitlines()[0]
-    sep = "\t" if "\t" in first else ","
-    read_kw = dict(sep=sep, dtype=str, skipinitialspace=True, engine="python", on_bad_lines="skip")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    sep = "\t" if "\t" in lines[0] else ","
+    rows = [[c.strip() for c in r]
+            for r in csv.reader(lines, delimiter=sep, skipinitialspace=True)]
 
-    df = pd.read_csv(StringIO(text), **read_kw)
-    df.columns = [str(c).strip() for c in df.columns]
-    lookup = {norm(c): c for c in df.columns}
-    ren = {lookup[norm(s)]: s for s in STD_COLS if norm(s) in lookup}
-
-    if len(ren) < 8:  # ヘッダー無しとみなす
-        df = pd.read_csv(StringIO(text), header=None, **read_kw)
-        if df.shape[1] < len(STD_COLS):
-            raise ValueError("列数が足りません。13列（Bracket〜Last Time）のCSVを貼り付けてください。")
-        df = df.iloc[:, : len(STD_COLS)]
-        df.columns = STD_COLS
+    # ヘッダー判定
+    std_lookup = {norm(s): s for s in STD_COLS}
+    hits = [std_lookup.get(norm(c)) for c in rows[0]]
+    if sum(h is not None for h in hits) >= 8:
+        header = [h if h else f"_extra{i}" for i, h in enumerate(hits)]
+        rows = rows[1:]
     else:
-        df = df.rename(columns=ren)
+        if len(rows[0]) < len(STD_COLS):
+            raise ValueError("列数が足りません。13列（Bracket〜Last Time）のCSVを貼り付けてください。")
+        header = list(STD_COLS)
 
+    ncols = len(header)
+    tp_idx = header.index("Total Prize") if "Total Prize" in header else None
+    fixed = []
+    for r in rows:
+        r = list(r)
+        # 賞金の「1,234」のようなカンマ区切りで列が増えた行を結合して戻す
+        if len(r) > ncols and tp_idx is not None:
+            extra = len(r) - ncols
+            r = r[:tp_idx] + ["".join(r[tp_idx: tp_idx + extra + 1])] + r[tp_idx + extra + 1:]
+        r = (r + [None] * ncols)[:ncols]
+        fixed.append(r)
+
+    if not fixed:
+        raise ValueError("出馬表のデータ行が読み取れませんでした（ヘッダーのみ、または空です）。")
+
+    df = pd.DataFrame(fixed, columns=header, dtype="object")
     for c in STD_COLS:
         if c not in df.columns:
-            df[c] = np.nan
+            df[c] = None
     df = df[STD_COLS].copy()
 
     # 全列を「文字列 or None」の object 型に統一
@@ -213,7 +227,10 @@ def parse_csv(text: str) -> pd.DataFrame:
 
     df = df.dropna(how="all")
     df = df[~(df["Horse Name"].isna() & df["Horse Number"].isna())]
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    if len(df) == 0:
+        raise ValueError("出馬表から1頭も読み取れませんでした。馬名・馬番の列を確認してください。")
+    return df
 
 
 def parse_time(v):
@@ -253,22 +270,13 @@ def preprocess(df: pd.DataFrame, venue, distance, track, weather) -> pd.DataFram
     df["Track Condition"] = track
     df["Weather"] = weather
 
-    for c, rule in NUM_DEFAULTS.items():
-        # 文字列型を経由せず、必ず numpy の float 配列に変換する
+    # 数値列: 補完（平均・中央値）はせず、読めない・空の値は 0 として扱う
+    for c in NUM_DEFAULTS:
         if c == "Last Time":
             arr = np.array([parse_time(v) for v in df[c]], dtype=float)
         else:
             arr = to_float_array(df[c])
-
-        if isinstance(rule, str):
-            kind, fallback = rule.split(":")
-            base = safe_stat(arr, kind)
-            fill = base if not np.isnan(base) else float(fallback)
-        else:
-            fill = float(rule)
-
-        arr = np.where(np.isnan(arr), fill, arr)
-        df[c] = pd.Series(arr, index=df.index, dtype="float64")
+        df[c] = pd.Series(np.nan_to_num(arr, nan=0.0), index=df.index, dtype="float64")
 
     # 脚質: 表示用ラベルと、モデル入力用の数値
     code_arr = np.array([parse_tactics(v) for v in df["Tactics"]], dtype=float)
@@ -276,10 +284,7 @@ def preprocess(df: pd.DataFrame, venue, distance, track, weather) -> pd.DataFram
     df["脚質ラベル"] = [
         TACTICS_LABEL.get(int(x), "不明") if not np.isnan(x) else "不明" for x in code_arr
     ]
-    med = safe_stat(code_arr, "median")
-    fill_t = med if not np.isnan(med) else 2.0
-    df["Tactics"] = pd.Series(np.where(np.isnan(code_arr), fill_t, code_arr),
-                              index=df.index, dtype="float64")
+    df["Tactics"] = pd.Series(np.nan_to_num(code_arr, nan=0.0), index=df.index, dtype="float64")
 
     for c in STR_COLS:
         if c in df.columns:
@@ -472,6 +477,8 @@ if run:
             feats = get_feature_names(model, meta) or DEFAULT_FEATURES
             X, missing = build_X(df, feats)
             X = encode_X(X)
+            if X.shape[0] == 0 or X.shape[1] == 0:
+                raise ValueError(f"モデルへの入力が空です（行数={X.shape[0]}, 列数={X.shape[1]}）。")
 
             proba = predict_top3(model, X[feats])
 
