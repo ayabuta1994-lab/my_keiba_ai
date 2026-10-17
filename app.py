@@ -531,6 +531,49 @@ def check_gsheets_secrets():
                            "（-----BEGIN PRIVATE KEY----- で始まる値をそのまま貼ってください）。")
 
 
+LOG_COLS = [
+    "Execution Date", "Race Day", "Race Name", "Venue", "Distance",
+    "Track Condition", "Weather", "Bracket", "Horse Number", "Horse Name",
+    "Sex", "Horse Age", "Burden Weight", "Jockey", "Trainer", "Tactics",
+    "AI_Probability", "AI_Rank", "Placing",
+]
+
+
+def build_log(df, proba, now, race_day, race_name, venue, distance, track, weather):
+    """前処理済み出馬表 df と AI予想を、1頭1行・全19列のログに組み立てる（再学習用）。"""
+    prob = np.round(np.asarray(proba, dtype=float) * 100, 1)
+    # 画面の順位表と同じ並び（確率降順・同率は元の行順）で順位を付ける
+    order = np.argsort(-prob, kind="stable")
+    rank = np.empty(len(prob), dtype=int)
+    rank[order] = np.arange(1, len(prob) + 1)
+
+    n = len(df)
+    log = pd.DataFrame({
+        "Execution Date": [now] * n,
+        "Race Day": [str(race_day)] * n,
+        "Race Name": [race_name or ""] * n,
+        "Venue": [venue] * n,
+        "Distance": [int(distance)] * n,
+        "Track Condition": [track] * n,
+        "Weather": [weather] * n,
+        "Bracket": df["Bracket"].astype(int).values,
+        "Horse Number": df["Horse Number"].astype(int).values,
+        "Horse Name": df["Horse Name"].values,
+        "Sex": df["Sex"].values,
+        "Horse Age": df["Horse Age"].astype(int).values,
+        "Burden Weight": df["Burden Weight"].astype(float).values,
+        "Jockey": df["Jockey"].values,
+        "Trainer": df["Trainer"].values,
+        # 脚質は 1〜4。読み取れなかった馬は空欄にする
+        "Tactics": pd.array([int(x) if pd.notna(x) else pd.NA for x in df["TacticsCode"]], dtype="Int64"),
+        "AI_Probability": prob,
+        "AI_Rank": rank,
+        "Placing": [None] * n,  # レース後に手動で着順を追記
+    })
+    log = log.sort_values("Horse Number", kind="stable").reset_index(drop=True)
+    return log[LOG_COLS]
+
+
 def append_to_sheet(new_rows: pd.DataFrame):
     check_gsheets_secrets()
     conn = st.connection("gsheets", type=GSheetsConnection)
@@ -539,113 +582,383 @@ def append_to_sheet(new_rows: pd.DataFrame):
         existing = existing.dropna(how="all").dropna(axis=1, how="all") if existing is not None else pd.DataFrame()
     except Exception:
         existing = pd.DataFrame()
+
+    if len(existing):
+        existing = _clean_columns(existing)  # 手入力の過去データ（結果のみ行）の列名揺れを吸収
     combined = pd.concat([existing, new_rows], ignore_index=True)
+    # 日付は YYYY-MM-DD に統一（シート側で日付型になっていても崩さない）
+    combined["Race Day"] = [_day_str(v) for v in combined["Race Day"]]
+    # 列順を仕様どおりに固定（旧形式の列があれば右側に残す）
+    for c in LOG_COLS:
+        if c not in combined.columns:
+            combined[c] = None
+    extra = [c for c in combined.columns if c not in LOG_COLS]
+    combined = combined[LOG_COLS + extra]
+    # 空欄（None/NaN）は空文字で書き出す（Placing は空欄のまま）
+    combined = combined.astype(object).where(combined.notna(), "")
     conn.update(worksheet="predictions", data=combined)
+
+
+# ------------------------------------------------------------------
+# 過去ログ・精度検証
+# ------------------------------------------------------------------
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """列名の空白除去・文字列化・重複列の除去（シート手入力の揺れ対策）。"""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df.loc[:, ~pd.Index(df.columns).duplicated()]
+
+
+def load_history() -> pd.DataFrame:
+    check_gsheets_secrets()
+    conn = st.connection("gsheets", type=GSheetsConnection)
+    raw = conn.read(worksheet="predictions", ttl=0)
+    if raw is None:
+        return pd.DataFrame()
+    raw = raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    return _clean_columns(raw)
+
+
+def _parse_day(v):
+    """日付の表記揺れ（2021-07-03 / 2021/7/3 / 2021年7月3日 / Excelシリアル値）を Timestamp に。"""
+    if _is_missing(v):
+        return pd.NaT
+    if isinstance(v, bool):
+        return pd.NaT
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        if 30000 < float(v) < 80000:  # Excel のシリアル値
+            return pd.Timestamp("1899-12-30") + pd.Timedelta(days=float(v))
+        return pd.NaT
+    if not isinstance(v, str):
+        try:
+            return pd.Timestamp(v)
+        except Exception:
+            return pd.NaT
+    s = v.strip().replace("日", "")
+    s = re.sub(r"[年月/.]", "-", s).strip("- ")
+    if not s:
+        return pd.NaT
+    try:
+        return pd.to_datetime(s, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+
+def _day_str(v) -> str:
+    """日付は YYYY-MM-DD の文字列に統一。解釈できなければ元の文字列のまま。"""
+    if _is_missing(v):
+        return ""
+    ts = _parse_day(v)
+    return ts.strftime("%Y-%m-%d") if pd.notna(ts) else str(v)
+
+
+def to_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    """st.dataframe 用: 数値以外の列は全て文字列化（数値と文字の混在によるArrowエラー防止）。"""
+    out = df.copy()
+    out.columns = [str(c) for c in out.columns]
+    for c in out.columns:
+        s = out[c]
+        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+            continue
+        out[c] = pd.Series(["" if _is_missing(v) else str(v) for v in s],
+                           index=out.index, dtype="object")
+    return out
+
+
+def prepare_history(raw: pd.DataFrame) -> pd.DataFrame:
+    """予想なし（結果のみ）の行や、空欄・文字・None の混在があっても落ちないよう集計用の列を作る。"""
+    h = _clean_columns(raw)
+    for c in LOG_COLS:
+        if c not in h.columns:
+            h[c] = np.nan
+
+    def num(col):
+        return pd.Series(to_float_array(h[col]), index=h.index, dtype="float64")
+
+    h["_placing"] = num("Placing")
+    h.loc[h["_placing"] < 1, "_placing"] = np.nan   # 0 や負数は結果なし扱い
+    h["_rank"] = num("AI_Rank")
+    h.loc[h["_rank"] < 1, "_rank"] = np.nan         # 予想なし（空欄）は NaN のまま
+    h["_prob"] = num("AI_Probability")
+    h["_hn"] = num("Horse Number")
+
+    days = h["Race Day"]
+    cache = {u: _parse_day(u) for u in days.dropna().unique()}
+    h["_day"] = pd.to_datetime(days.map(cache), errors="coerce")
+    # 並べ替え用: 型が混在していても比較で落ちないよう文字列化
+    h["_exec"] = ["" if _is_missing(v) else str(v) for v in h["Execution Date"]]
+    return h
+
+
+def _count(d: pd.DataFrame) -> dict:
+    return {
+        "n": int(len(d)),
+        "win": int((d["_placing"] == 1).sum()),
+        "ren": int((d["_placing"] <= 2).sum()),
+        "fuku": int((d["_placing"] <= 3).sum()),
+    }
+
+
+def compute_stats(h: pd.DataFrame):
+    """「AI_Rank が存在」かつ「Placing が入力済み」の行だけを集計対象にする。無ければ None。"""
+    done = h[h["_placing"].notna() & h["_rank"].notna()]
+    if done.empty:
+        return None
+    keys = done[["Execution Date", "Race Day", "Race Name"]].astype(str).agg("|".join, axis=1)
+    p = done["_prob"]
+    buckets = [
+        ("70%以上", done[p >= 70]),
+        ("50〜69%", done[(p >= 50) & (p < 70)]),
+        ("50%未満", done[p < 50]),
+    ]
+    return {
+        "n_races": int(keys.nunique()),
+        "n_horses": int(len(done)),
+        "honmei": _count(done[done["_rank"] == 1]),
+        "top3": _count(done[done["_rank"] <= 3]),
+        "buckets": [(name, _count(d)) for name, d in buckets],
+    }
+
+
+def _pct(num: int, den: int) -> str:
+    return f"{num / den * 100:.1f}%" if den else "—"
+
+
+def _pct_val(num: int, den: int):
+    return round(num / den * 100, 1) if den else None
+
+
+def render_history_tab():
+    if st.button("🔄 最新データを読み込む", key="hist_reload"):
+        st.session_state.pop("history_df", None)
+        st.session_state.pop("history_err", None)
+
+    # 絞り込みのたびにAPIを叩かないよう、読み込み結果は session_state に保持する
+    if "history_df" not in st.session_state:
+        try:
+            with st.spinner("スプレッドシートを読み込み中…"):
+                st.session_state["history_df"] = load_history()
+            st.session_state.pop("history_err", None)
+        except Exception as e:
+            st.session_state["history_df"] = None
+            st.session_state["history_err"] = str(e)
+
+    raw = st.session_state.get("history_df")
+    if raw is None:
+        st.error(f"過去ログの読み込みに失敗しました: {st.session_state.get('history_err', '')}")
+        return
+    if raw.empty:
+        st.info("まだ保存された予想がありません。予想を実行するとここに蓄積されます。")
+        return
+
+    try:
+        h = prepare_history(raw)
+    except Exception as e:
+        st.error(f"過去ログの整形中にエラーが発生しました: {e}")
+        st.dataframe(to_display_df(raw), hide_index=True, use_container_width=True, height=420)
+        return
+
+    # ---- 検索・フィルタ ----
+    st.subheader("過去の予想を探す")
+    f1, f2 = st.columns(2)
+    with f1:
+        q = st.text_input("レース名検索", key="hist_q", placeholder="例：菊花賞")
+    with f2:
+        venues = sorted(set(h["Venue"].dropna().astype(str)) - {""})
+        sel_v = st.multiselect("競馬場フィルタ（未選択＝すべて）", venues, key="hist_v")
+
+    mask = pd.Series(True, index=h.index)
+    if q.strip():
+        mask &= h["Race Name"].astype(str).str.contains(q.strip(), case=False, na=False, regex=False)
+    if sel_v:
+        mask &= h["Venue"].astype(str).isin(sel_v)
+
+    valid_days = h["_day"].dropna()
+    if not valid_days.empty:
+        dmin, dmax = valid_days.min().date(), valid_days.max().date()
+        if dmin < dmax:
+            rng = st.date_input("日付フィルタ（レース開催日）", value=(dmin, dmax),
+                                min_value=dmin, max_value=dmax, key="hist_d")
+            if isinstance(rng, (tuple, list)) and len(rng) > 0:
+                start = rng[0]
+                end = rng[1] if len(rng) > 1 else rng[0]
+                if (start, end) != (dmin, dmax):
+                    d = h["_day"].dt.date
+                    mask &= d.notna() & (d >= start) & (d <= end)
+        else:
+            st.caption(f"開催日: {dmin}（1日分のみ）")
+
+    only_done = st.checkbox("結果（Placing）入力済みのみ表示", key="hist_done")
+    if only_done:
+        mask &= h["_placing"].notna()
+
+    view = h[mask].copy()
+    view = view.sort_values(["_day", "_exec", "_hn"],
+                            ascending=[False, False, True], na_position="last")
+
+    # 予想なし（AI_Probability 等が空欄）の行も、レース名・日付・馬名・着順などをそのまま閲覧可能
+    raw_cols = [str(c) for c in raw.columns]
+    show_cols = [c for c in LOG_COLS if c in raw_cols] + [c for c in raw_cols if c not in LOG_COLS]
+    shown = view[show_cols].copy()
+    if "Race Day" in shown.columns:
+        shown["Race Day"] = [
+            ts.strftime("%Y-%m-%d") if pd.notna(ts) else ("" if _is_missing(orig) else str(orig))
+            for ts, orig in zip(view["_day"], shown["Race Day"])
+        ]
+
+    n_pred = int(view["_rank"].notna().sum())
+    st.caption(f"該当 {len(view)} 頭 / 全 {len(h)} 頭（うちAI予想あり {n_pred} 頭、結果のみ {len(view) - n_pred} 頭）")
+    st.dataframe(to_display_df(shown), hide_index=True, use_container_width=True, height=420)
+
+    # ---- 成績集計（AI_Rank あり かつ Placing 入力済み） ----
+    st.subheader("AIの的中率・成績")
+    st.caption("※上の絞り込み条件を反映し、AI予想（AI_Rank）があり、かつ Placing に数値が入っている行だけを集計します。"
+               "AI_Probability は「3着以内に入る確率」です。")
+    n_results_only = int((view["_placing"].notna() & view["_rank"].isna()).sum())
+    if n_results_only:
+        st.caption(f"予想データのない結果のみの {n_results_only} 頭は、集計から除外しています。")
+
+    stats = compute_stats(view)
+    if stats is None:
+        st.info("スプレッドシートのPlacing列に結果を入力すると、ここに的中率が表示されます")
+        return
+
+    m1, m2 = st.columns(2)
+    m1.metric("検証レース数", f"{stats['n_races']}")
+    m2.metric("検証頭数", f"{stats['n_horses']}")
+
+    st.markdown("**AI本命（AI_Rank = 1）の成績**")
+    hon = stats["honmei"]
+    a, b, c = st.columns(3)
+    a.metric("勝率（1着）", _pct(hon["win"], hon["n"]))
+    b.metric("連対率（2着以内）", _pct(hon["ren"], hon["n"]))
+    c.metric("複勝率（3着以内）", _pct(hon["fuku"], hon["n"]))
+    st.caption(f"本命 {hon['n']}頭中: 1着 {hon['win']} / 2着以内 {hon['ren']} / 3着以内 {hon['fuku']}")
+
+    st.markdown("**AI予想上位（AI_Rank ≦ 3）**")
+    t3 = stats["top3"]
+    st.metric("複勝率（3着以内）", _pct(t3["fuku"], t3["n"]))
+    st.caption(f"上位3頭 計{t3['n']}頭中、3着以内 {t3['fuku']}頭")
+
+    st.markdown("**予想確率別の的中率**")
+    rows = [{
+        "予想確率": name, "頭数": d["n"],
+        "勝率(%)": _pct_val(d["win"], d["n"]),
+        "複勝率(%)": _pct_val(d["fuku"], d["n"]),
+    } for name, d in stats["buckets"]]
+    st.dataframe(
+        pd.DataFrame(rows), hide_index=True, use_container_width=True,
+        column_config={
+            "勝率(%)": st.column_config.ProgressColumn("勝率(%)", format="%.1f%%", min_value=0, max_value=100),
+            "複勝率(%)": st.column_config.ProgressColumn("複勝率(%)", format="%.1f%%", min_value=0, max_value=100),
+        },
+    )
 
 
 # ------------------------------------------------------------------
 # 画面メイン描画処理
 # ------------------------------------------------------------------
-try:
-    model, meta = load_model()
-except Exception as e:
-    st.error(f"model.pkl の読み込みに失敗しました: {e}")
-    st.stop()
+tab_run, tab_hist = st.tabs(["🔮 AI予想を実行", "📚 過去ログ＆的中率確認"])
 
-st.subheader("① レース情報")
-c1, c2 = st.columns(2)
-with c1:
-    venue = st.selectbox("競馬場（Venue）", VENUES, index=VENUES.index("東京"))
-    track = st.selectbox("馬場状態（Track Condition）", TRACKS)
-with c2:
-    distance = st.selectbox("距離（Distance）", DISTANCES, index=DISTANCES.index(1600))
-    weather = st.selectbox("天気（Weather）", WEATHERS)
-race_name = st.text_input("レース名（任意・記録用）", placeholder="例：菊花賞")
+with tab_hist:
+    render_history_tab()
 
-st.subheader("② 出馬表を貼り付け")
-csv_text = st.text_area(
-    "出馬表CSV",
-    height=320,
-    label_visibility="collapsed",
-    placeholder="ここに整形したCSVデータを貼り付けてください",
-)
+with tab_run:
+    try:
+        model, meta = load_model()
+    except Exception as e:
+        st.error(f"model.pkl の読み込みに失敗しました: {e}")
+        st.stop()
 
-run = st.button("🔮 AI予想を実行する", type="primary", use_container_width=True)
+    st.subheader("① レース情報")
+    c1, c2 = st.columns(2)
+    with c1:
+        venue = st.selectbox("競馬場（Venue）", VENUES, index=VENUES.index("東京"))
+        track = st.selectbox("馬場状態（Track Condition）", TRACKS)
+    with c2:
+        distance = st.selectbox("距離（Distance）", DISTANCES, index=DISTANCES.index(1600))
+        weather = st.selectbox("天気（Weather）", WEATHERS)
+    race_name = st.text_input("レース名（任意・記録用）", placeholder="例：菊花賞")
+    race_day = st.date_input("レース開催日（記録用）", value=datetime.now(JST).date())
 
-if run:
-    st.session_state.pop("saved", None)
-    st.session_state.pop("save_error", None)
-    if not csv_text.strip():
-        st.warning("出馬表CSVを貼り付けてください。")
-    else:
-        try:
-            raw = parse_csv(csv_text)
-            df = preprocess(raw, venue, distance, track, weather)
-            pace = diagnose_pace(df)
-
-            feats = get_feature_names(model, meta) or DEFAULT_FEATURES
-            X, missing = build_X(df, feats)
-            X = encode_X(X, model, meta)
-            if X.shape[0] == 0 or X.shape[1] == 0:
-                raise ValueError(f"モデルへの入力が空です（行数={X.shape[0]}, 列数={X.shape[1]}）。")
-
-            proba = predict_top3(model, X[feats])
-
-            now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-            out = pd.DataFrame({
-                "馬番": df["Horse Number"].astype(int),
-                "馬名": df["Horse Name"],
-                "種牡馬": df["Sire"],
-                "想定脚質": df["脚質ラベル"],
-                "AI予想確率(%)": np.round(np.asarray(proba, dtype=float) * 100, 1),
-            })
-            out = out.sort_values("AI予想確率(%)", ascending=False, kind="stable").reset_index(drop=True)
-            out.insert(0, "順位", np.arange(1, len(out) + 1))
-
-            st.session_state["result"] = out
-            st.session_state["pace"] = pace
-
-            # スプレッドシートに蓄積するためのログを作成
-            log = out.copy()
-            log.insert(0, "実行日時", now)
-            log.insert(1, "レース名", race_name)
-            log.insert(2, "競馬場", venue)
-            log.insert(3, "距離", distance)
-            log.insert(4, "馬場状態", track)
-            log.insert(5, "天気", weather)
-            log.insert(6, "想定ペース", pace.get("pace", "不明"))
-
-            try:
-                append_to_sheet(log)
-                st.session_state["saved"] = True
-            except Exception as e:
-                st.session_state["saved"] = False
-                st.session_state["save_error"] = str(e)
-
-        except Exception as e:
-            st.session_state.pop("result", None)
-            st.error(f"予想中にエラーが発生しました: {e}")
-
-# 🔮 画面への最終結果出力エリア
-if "result" in st.session_state:
-    out = st.session_state["result"]
-    render_pace(st.session_state.get("pace", {"ok": False}), out)
-
-    st.subheader(f"④ AI予想結果（全{len(out)}頭・3着以内確率順）")
-    st.dataframe(
-        out,
-        hide_index=True,
-        use_container_width=True,
-        height=int(38 * (len(out) + 1)),
-        column_config={
-            "順位": st.column_config.NumberColumn("順位", width="small"),
-            "馬番": st.column_config.NumberColumn("馬番", width="small"),
-            "AI予想確率(%)": st.column_config.ProgressColumn(
-                "AI予想確率(%)", format="%.1f%%", min_value=0, max_value=100
-            ),
-        },
+    st.subheader("② 出馬表を貼り付け")
+    csv_text = st.text_area(
+        "出馬表CSV",
+        height=320,
+        label_visibility="collapsed",
+        placeholder="ここに整形したCSVデータを貼り付けてください",
     )
-    if st.session_state.get("saved"):
-        st.success("データ蓄積完了")
-    elif st.session_state.get("saved") is False:
-        st.warning(f"スプレッドシートへの保存に失敗しました: {st.session_state.get('save_error', '')}")
+
+    run = st.button("🔮 AI予想を実行する", type="primary", use_container_width=True)
+
+    if run:
+        st.session_state.pop("saved", None)
+        st.session_state.pop("save_error", None)
+        if not csv_text.strip():
+            st.warning("出馬表CSVを貼り付けてください。")
+        else:
+            try:
+                raw = parse_csv(csv_text)
+                df = preprocess(raw, venue, distance, track, weather)
+                pace = diagnose_pace(df)
+
+                feats = get_feature_names(model, meta) or DEFAULT_FEATURES
+                X, missing = build_X(df, feats)
+                X = encode_X(X, model, meta)
+                if X.shape[0] == 0 or X.shape[1] == 0:
+                    raise ValueError(f"モデルへの入力が空です（行数={X.shape[0]}, 列数={X.shape[1]}）。")
+
+                proba = predict_top3(model, X[feats])
+
+                now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+                out = pd.DataFrame({
+                    "馬番": df["Horse Number"].astype(int),
+                    "馬名": df["Horse Name"],
+                    "種牡馬": df["Sire"],
+                    "想定脚質": df["脚質ラベル"],
+                    "AI予想確率(%)": np.round(np.asarray(proba, dtype=float) * 100, 1),
+                })
+                out = out.sort_values("AI予想確率(%)", ascending=False, kind="stable").reset_index(drop=True)
+                out.insert(0, "順位", np.arange(1, len(out) + 1))
+
+                st.session_state["result"] = out
+                st.session_state["pace"] = pace
+
+                # スプレッドシートに蓄積するログ（全19列・1頭1行）を作成
+                log = build_log(df, proba, now, race_day, race_name, venue, distance, track, weather)
+
+                try:
+                    append_to_sheet(log)
+                    st.session_state["saved"] = True
+                    st.session_state.pop("history_df", None)  # 次回表示時に最新ログを再読込
+                except Exception as e:
+                    st.session_state["saved"] = False
+                    st.session_state["save_error"] = str(e)
+
+            except Exception as e:
+                st.session_state.pop("result", None)
+                st.error(f"予想中にエラーが発生しました: {e}")
+
+    # 🔮 画面への最終結果出力エリア
+    if "result" in st.session_state:
+        out = st.session_state["result"]
+        render_pace(st.session_state.get("pace", {"ok": False}), out)
+
+        st.subheader(f"④ AI予想結果（全{len(out)}頭・3着以内確率順）")
+        st.dataframe(
+            out,
+            hide_index=True,
+            use_container_width=True,
+            height=int(38 * (len(out) + 1)),
+            column_config={
+                "順位": st.column_config.NumberColumn("順位", width="small"),
+                "馬番": st.column_config.NumberColumn("馬番", width="small"),
+                "AI予想確率(%)": st.column_config.ProgressColumn(
+                    "AI予想確率(%)", format="%.1f%%", min_value=0, max_value=100
+                ),
+            },
+        )
+        if st.session_state.get("saved"):
+            st.success("データ蓄積完了")
+        elif st.session_state.get("saved") is False:
+            st.warning(f"スプレッドシートへの保存に失敗しました: {st.session_state.get('save_error', '')}")
