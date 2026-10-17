@@ -23,7 +23,6 @@ Streamlit Cloud の Secrets（Settings > Secrets）に以下を設定:
 """
 import pickle
 import re
-import traceback
 import zlib
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -35,6 +34,7 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 
 st.set_page_config(page_title="競馬予想AI v5", page_icon="🏇", layout="centered")
+st.title("🏇 競馬予想AI v5")
 
 MODEL_PATH = Path(__file__).parent / "model.pkl"
 JST = timezone(timedelta(hours=9))
@@ -51,6 +51,7 @@ NUM_DEFAULTS = {  # 数値列: 欠損時の補完方法（Tactics は別処理�
 }
 STR_COLS = ["Horse Name", "Sex", "Jockey", "Trainer", "Sire",
             "Venue", "Track Condition", "Weather"]
+CAT_COLS = ["Venue", "Track Condition", "Weather", "Jockey", "Trainer", "Sire", "Sex"]
 TACTICS_LABEL = {1: "逃げ", 2: "先行", 3: "差し", 4: "追込"}
 
 VENUES = ["札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉", "その他"]
@@ -61,6 +62,40 @@ WEATHERS = ["晴", "曇", "小雨", "雨", "雪"]
 
 def norm(s) -> str:
     return re.sub(r"[\s_\-]", "", str(s)).lower()
+
+
+# ------------------------------------------------------------------
+# 数値化ユーティリティ（pandasの文字列型に依存しない）
+# ------------------------------------------------------------------
+def _is_missing(v) -> bool:
+    if v is None:
+        return True
+    try:
+        return bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def num_scalar(v) -> float:
+    """任意の値から最初の数値を取り出して float にする。取れなければ NaN。"""
+    if _is_missing(v):
+        return np.nan
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v)
+    m = re.search(r"-?\d+(?:\.\d+)?", str(v).replace(",", ""))
+    return float(m.group()) if m else np.nan
+
+
+def to_float_array(values) -> np.ndarray:
+    return np.array([num_scalar(v) for v in values], dtype=float)
+
+
+def safe_stat(arr: np.ndarray, kind: str) -> float:
+    """NaN を除いた median / mean。全部 NaN なら NaN を返す。"""
+    finite = arr[~np.isnan(arr)]
+    if finite.size == 0:
+        return np.nan
+    return float(np.median(finite) if kind == "median" else np.mean(finite))
 
 
 # ------------------------------------------------------------------
@@ -164,15 +199,25 @@ def parse_csv(text: str) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
     df = df[STD_COLS].copy()
+
+    # 全列を「文字列 or None」の object 型に統一
     for c in df.columns:
-        df[c] = df[c].astype(str).str.strip().replace({"nan": np.nan, "None": np.nan, "": np.nan})
+        vals = []
+        for v in df[c]:
+            if _is_missing(v):
+                vals.append(None)
+                continue
+            s = str(v).strip()
+            vals.append(None if s in ("", "nan", "None", "<NA>") else s)
+        df[c] = pd.Series(vals, index=df.index, dtype="object")
+
     df = df.dropna(how="all")
     df = df[~(df["Horse Name"].isna() & df["Horse Number"].isna())]
     return df.reset_index(drop=True)
 
 
 def parse_time(v):
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+    if _is_missing(v):
         return np.nan
     s = str(v).strip()
     m = re.match(r"^(\d+):(\d+(?:\.\d+)?)$", s)
@@ -189,7 +234,7 @@ def parse_time(v):
 
 def parse_tactics(v):
     """脚質を 1=逃げ 2=先行 3=差し 4=追込 に正規化。"""
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+    if _is_missing(v):
         return np.nan
     s = str(v).strip()
     m = re.match(r"^([1-4])(?:\.0+)?$", s)
@@ -201,11 +246,6 @@ def parse_tactics(v):
     return np.nan
 
 
-def to_number(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.replace(",", "", regex=False)
-    return pd.to_numeric(s.str.extract(r"(-?\d+(?:\.\d+)?)")[0], errors="coerce")
-
-
 def preprocess(df: pd.DataFrame, venue, distance, track, weather) -> pd.DataFrame:
     df = df.copy()
     df["Venue"] = venue
@@ -213,43 +253,47 @@ def preprocess(df: pd.DataFrame, venue, distance, track, weather) -> pd.DataFram
     df["Track Condition"] = track
     df["Weather"] = weather
 
-    for c in NUM_DEFAULTS:
+    for c, rule in NUM_DEFAULTS.items():
+        # 文字列型を経由せず、必ず numpy の float 配列に変換する
         if c == "Last Time":
-            # タイムの文字列を安全にパース
-            df[c] = df[c].map(parse_time)
+            arr = np.array([parse_time(v) for v in df[c]], dtype=float)
         else:
-            # カンマ等を除去し、まず文字列型から抽出
-            s_clean = df[c].astype(str).str.replace(",", "", regex=False)
-            df[c] = pd.to_numeric(s_clean.str.extract(r"(-?\d+(?:\.\d+)?)")[0], errors="coerce")
-        
-        # 🚨 【今回のエラー特効薬】ここで確実に数値型(float)に揃えてから平均値を計算させます
-        df[c] = df[c].astype(float)
-        
-        rule = NUM_DEFAULTS[c]
+            arr = to_float_array(df[c])
+
         if isinstance(rule, str):
             kind, fallback = rule.split(":")
-            base = df[c].median() if kind == "median" else df[c].mean()
-            fill = base if pd.notna(base) else float(fallback)
+            base = safe_stat(arr, kind)
+            fill = base if not np.isnan(base) else float(fallback)
         else:
-            fill = rule
-        df[c] = df[c].fillna(fill).astype(float)
+            fill = float(rule)
+
+        arr = np.where(np.isnan(arr), fill, arr)
+        df[c] = pd.Series(arr, index=df.index, dtype="float64")
 
     # 脚質: 表示用ラベルと、モデル入力用の数値
-    code = df["Tactics"].map(parse_tactics)
-    df["TacticsCode"] = code
-    df["脚質ラベル"] = code.map(lambda x: TACTICS_LABEL.get(int(x), "不明") if pd.notna(x) else "不明")
-    med = code.median()
-    df["Tactics"] = code.fillna(med if pd.notna(med) else 2.0).astype(float)
+    code_arr = np.array([parse_tactics(v) for v in df["Tactics"]], dtype=float)
+    df["TacticsCode"] = pd.Series(code_arr, index=df.index, dtype="float64")
+    df["脚質ラベル"] = [
+        TACTICS_LABEL.get(int(x), "不明") if not np.isnan(x) else "不明" for x in code_arr
+    ]
+    med = safe_stat(code_arr, "median")
+    fill_t = med if not np.isnan(med) else 2.0
+    df["Tactics"] = pd.Series(np.where(np.isnan(code_arr), fill_t, code_arr),
+                              index=df.index, dtype="float64")
 
     for c in STR_COLS:
         if c in df.columns:
-            df[c] = df[c].fillna("不明").astype(str).str.strip()
+            df[c] = pd.Series(
+                ["不明" if _is_missing(v) else str(v).strip() for v in df[c]],
+                index=df.index, dtype="object",
+            )
 
     # 馬番が取れなかった場合は行順で補完
     if (df["Horse Number"] == 0).all():
         df["Horse Number"] = np.arange(1, len(df) + 1, dtype=float)
-        
+
     return df
+
 
 # ------------------------------------------------------------------
 # 展開予想・ペース診断
@@ -327,7 +371,7 @@ def render_pace(p: dict, out: pd.DataFrame):
 
 
 # ------------------------------------------------------------------
-# 特徴量の組み立て・型エラー強制補正
+# 特徴量の組み立て
 # ------------------------------------------------------------------
 DEFAULT_FEATURES = [
     "Venue", "Distance", "Track Condition", "Weather", "Bracket", "Horse Number",
@@ -348,6 +392,23 @@ def build_X(df, feats):
         else:
             X[f] = df[src].values
     return X, missing
+
+
+def encode_X(X: pd.DataFrame) -> pd.DataFrame:
+    """全列を float に統一（カテゴリ列は crc32 ハッシュで数値化）。"""
+    X = X.copy()
+    for col in X.columns:
+        if col in CAT_COLS:
+            X[col] = pd.Series(
+                [float(zlib.crc32(str(v).encode("utf-8")) % 100) for v in X[col]],
+                index=X.index, dtype="float64",
+            )
+        else:
+            X[col] = pd.Series(
+                np.nan_to_num(to_float_array(X[col]), nan=0.0),
+                index=X.index, dtype="float64",
+            )
+    return X
 
 
 def predict_top3(model, X) -> np.ndarray:
@@ -371,6 +432,12 @@ def append_to_sheet(new_rows: pd.DataFrame):
 # ------------------------------------------------------------------
 # 画面メイン描画処理
 # ------------------------------------------------------------------
+try:
+    model, meta = load_model()
+except Exception as e:
+    st.error(f"model.pkl の読み込みに失敗しました: {e}")
+    st.stop()
+
 st.subheader("① レース情報")
 c1, c2 = st.columns(2)
 with c1:
@@ -392,6 +459,8 @@ csv_text = st.text_area(
 run = st.button("🔮 AI予想を実行する", type="primary", use_container_width=True)
 
 if run:
+    st.session_state.pop("saved", None)
+    st.session_state.pop("save_error", None)
     if not csv_text.strip():
         st.warning("出馬表CSVを貼り付けてください。")
     else:
@@ -402,15 +471,8 @@ if run:
 
             feats = get_feature_names(model, meta) or DEFAULT_FEATURES
             X, missing = build_X(df, feats)
+            X = encode_X(X)
 
-            # 🚨 【超重要】LightGBMの型エラーを強制回避（文字データを数値ハッシュに高速変換）
-            for col in X.columns:
-                if col in ["Venue", "Track Condition", "Weather", "Jockey", "Trainer", "Sire", "Sex"]:
-                    X[col] = X[col].astype(str).map(lambda v: float(zlib.crc32(v.encode()) % 100))
-                else:
-                    X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0).astype(float)
-
-            # 順番をDEFAULT_FEATURESと完全に一致させて予測を実行
             proba = predict_top3(model, X[feats])
 
             now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
@@ -442,11 +504,11 @@ if run:
                 st.session_state["saved"] = True
             except Exception as e:
                 st.session_state["saved"] = False
+                st.session_state["save_error"] = str(e)
 
         except Exception as e:
-    st.session_state.pop("result", None)
-    st.error(f"予想中にエラーが発生しました: {e}")
-    st.code(traceback.format_exc())
+            st.session_state.pop("result", None)
+            st.error(f"予想中にエラーが発生しました: {e}")
 
 # 🔮 画面への最終結果出力エリア
 if "result" in st.session_state:
@@ -469,3 +531,5 @@ if "result" in st.session_state:
     )
     if st.session_state.get("saved"):
         st.success("データ蓄積完了")
+    elif st.session_state.get("saved") is False:
+        st.warning(f"スプレッドシートへの保存に失敗しました: {st.session_state.get('save_error', '')}")
