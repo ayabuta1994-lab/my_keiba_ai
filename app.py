@@ -509,7 +509,30 @@ def predict_top3(model, X) -> np.ndarray:
     return np.clip(np.asarray(model.predict(X), dtype=float), 0, 1)
 
 
+def check_gsheets_secrets():
+    """Secrets の設定ミスを、原因が分かる日本語メッセージで知らせる。"""
+    try:
+        sec = st.secrets["connections"]["gsheets"]
+    except Exception:
+        raise RuntimeError(
+            "Secrets に [connections.gsheets] がありません。"
+            "Streamlit Cloud の Settings > Secrets に設定してください。")
+    if str(sec.get("type", "")) != "service_account":
+        raise RuntimeError(
+            'Secrets に type = "service_account" がありません'
+            "（無いと「公開シート」扱いになり書き込めません）。")
+    need = ["spreadsheet", "project_id", "private_key_id", "private_key",
+            "client_email", "client_id", "token_uri"]
+    missing = [k for k in need if not str(sec.get(k, "")).strip()]
+    if missing:
+        raise RuntimeError("Secrets に次の項目がありません: " + ", ".join(missing))
+    if "BEGIN PRIVATE KEY" not in str(sec["private_key"]):
+        raise RuntimeError("private_key の形式が正しくありません"
+                           "（-----BEGIN PRIVATE KEY----- で始まる値をそのまま貼ってください）。")
+
+
 def append_to_sheet(new_rows: pd.DataFrame):
+    check_gsheets_secrets()
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
         existing = conn.read(worksheet="predictions", ttl=0)
