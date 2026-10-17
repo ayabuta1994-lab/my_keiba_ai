@@ -215,14 +215,42 @@ def preprocess(df: pd.DataFrame, venue, distance, track, weather) -> pd.DataFram
 
     for c in NUM_DEFAULTS:
         if c == "Last Time":
+            # タイムの文字列を安全にパース
             df[c] = df[c].map(parse_time)
         else:
-            df[c] = to_number(df[c])
+            # カンマ等を除去し、まず文字列型から抽出
+            s_clean = df[c].astype(str).str.replace(",", "", regex=False)
+            df[c] = pd.to_numeric(s_clean.str.extract(r"(-?\d+(?:\.\d+)?)")[0], errors="coerce")
+        
+        # 🚨 【今回のエラー特効薬】ここで確実に数値型(float)に揃えてから平均値を計算させます
+        df[c] = df[c].astype(float)
+        
         rule = NUM_DEFAULTS[c]
         if isinstance(rule, str):
             kind, fallback = rule.split(":")
             base = df[c].median() if kind == "median" else df[c].mean()
             fill = base if pd.notna(base) else float(fallback)
+        else:
+            fill = rule
+        df[c] = df[c].fillna(fill).astype(float)
+
+    # 脚質: 表示用ラベルと、モデル入力用の数値
+    code = df["Tactics"].map(parse_tactics)
+    df["TacticsCode"] = code
+    df["脚質ラベル"] = code.map(lambda x: TACTICS_LABEL.get(int(x), "不明") if pd.notna(x) else "不明")
+    med = code.median()
+    df["Tactics"] = code.fillna(med if pd.notna(med) else 2.0).astype(float)
+
+    for c in STR_COLS:
+        if c in df.columns:
+            df[c] = df[c].fillna("不明").astype(str).str.strip()
+
+    # 馬番が取れなかった場合は行順で補完
+    if (df["Horse Number"] == 0).all():
+        df["Horse Number"] = np.arange(1, len(df) + 1, dtype=float)
+        
+    return df
+ base if pd.notna(base) else float(fallback)
         else:
             fill = rule
         df[c] = df[c].fillna(fill).astype(float)
