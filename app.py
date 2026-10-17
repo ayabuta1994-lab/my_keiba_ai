@@ -250,26 +250,6 @@ def preprocess(df: pd.DataFrame, venue, distance, track, weather) -> pd.DataFram
         df["Horse Number"] = np.arange(1, len(df) + 1, dtype=float)
         
     return df
- base if pd.notna(base) else float(fallback)
-        else:
-            fill = rule
-        df[c] = df[c].fillna(fill).astype(float)
-
-    # 脚質: 表示用ラベルと、モデル入力用の数値
-    code = df["Tactics"].map(parse_tactics)
-    df["TacticsCode"] = code
-    df["脚質ラベル"] = code.map(lambda x: TACTICS_LABEL.get(int(x), "不明") if pd.notna(x) else "不明")
-    med = code.median()
-    df["Tactics"] = code.fillna(med if pd.notna(med) else 2.0).astype(float)
-
-    for c in STR_COLS:
-        if c in df.columns:
-            df[c] = df[c].fillna("不明").astype(str).str.strip()
-
-    if (df["Horse Number"] == 0).all():
-        df["Horse Number"] = np.arange(1, len(df) + 1, dtype=float)
-    return df
-
 
 # ------------------------------------------------------------------
 # 展開予想・ペース診断
