@@ -399,15 +399,101 @@ def build_X(df, feats):
     return X, missing
 
 
-def encode_X(X: pd.DataFrame) -> pd.DataFrame:
-    """全列を float に統一（カテゴリ列は crc32 ハッシュで数値化）。"""
+def get_pandas_categorical(model):
+    """LightGBM が学習時に覚えた category 列のカテゴリ一覧（無ければ None）。"""
+    for obj in (model, getattr(model, "booster_", None), getattr(model, "_Booster", None)):
+        if obj is None:
+            continue
+        pc = getattr(obj, "pandas_categorical", None)
+        if pc:
+            return pc
+    return None
+
+
+def exact_categorical_columns(model, columns, n_expected):
+    """モデル内部(feature_infos)から、学習時に category 型だった列名を学習時の列順で返す。
+    特定できない／個数が合わない場合は None。"""
+    for obj in (model, getattr(model, "booster_", None), getattr(model, "_Booster", None)):
+        if obj is None or not hasattr(obj, "model_to_string"):
+            continue
+        try:
+            text = obj.model_to_string()
+            names = list(obj.feature_name())
+            m = re.search(r"^feature_infos=(.*)$", text, re.M)
+            if not m:
+                continue
+            infos = m.group(1).strip().split(" ")
+            cols = [names[i] for i, x in enumerate(infos)
+                    if i < len(names) and x != "none" and not x.startswith("[")]
+            by_norm = {norm(c): c for c in columns}
+            cols = [by_norm[norm(c)] for c in cols if norm(c) in by_norm]
+            if len(cols) == n_expected:
+                return cols
+        except Exception:
+            continue
+    return None
+
+
+def _find_encoder(meta, col):
+    for k, enc in (meta.get("encoders") or {}).items():
+        if norm(k) == norm(col) and hasattr(enc, "classes_"):
+            return enc
+    return None
+
+
+def encode_X(X: pd.DataFrame, model=None, meta=None) -> pd.DataFrame:
+    """モデルに渡す形へ変換。
+    1) LightGBM が category 型で学習していた場合 → 同じカテゴリ定義の category 型にする
+    2) LabelEncoder が pkl に入っている場合 → それで数値化（未知は -1）
+    3) どちらも無ければ crc32 ハッシュで数値化
+    """
+    meta = meta or {}
     X = X.copy()
+    str_cols = [c for c in X.columns if norm(c) in {norm(s) for s in STR_COLS}]
+    pcat = get_pandas_categorical(model) if model is not None else None
+
+    cat_map = {}  # 列名 -> カテゴリ一覧
+    if pcat:
+        exact = exact_categorical_columns(model, list(X.columns), len(pcat))
+        if exact:
+            for col, cats in zip(exact, pcat):
+                cat_map[col] = list(cats)
+    if pcat and not cat_map:
+        cand = list(str_cols)
+        if len(cand) < len(pcat):
+            raise ValueError(
+                f"モデルは category 列を {len(pcat)} 個使っていますが、"
+                f"入力側の文字列列は {len(cand)} 個しかありません。")
+        if len(cand) > len(pcat):
+            # カテゴリ一覧との一致度が高い列を選ぶ（元の列順は保つ）
+            def score(col, cats):
+                cs = set(map(str, cats))
+                return sum(str(v) in cs for v in X[col])
+            chosen, used = [], set()
+            for cats in pcat:
+                best = max((c for c in cand if c not in used), key=lambda c: score(c, cats))
+                used.add(best)
+                chosen.append(best)
+            cand = [c for c in X.columns if c in used]
+        for col, cats in zip(cand, pcat):
+            cat_map[col] = list(cats)
+
     for col in X.columns:
-        if col in CAT_COLS:
-            X[col] = pd.Series(
-                [float(zlib.crc32(str(v).encode("utf-8")) % 100) for v in X[col]],
-                index=X.index, dtype="float64",
-            )
+        if col in cat_map:
+            cats = cat_map[col]
+            as_str = all(isinstance(c, str) for c in cats)
+            vals = [str(v) if as_str else v for v in X[col]]
+            X[col] = pd.Categorical(vals, categories=cats)
+        elif col in str_cols:
+            enc = _find_encoder(meta, col)
+            if enc is not None:
+                table = {str(c): i for i, c in enumerate(enc.classes_)}
+                X[col] = pd.Series([float(table.get(str(v), -1)) for v in X[col]],
+                                   index=X.index, dtype="float64")
+            else:
+                X[col] = pd.Series(
+                    [float(zlib.crc32(str(v).encode("utf-8")) % 100) for v in X[col]],
+                    index=X.index, dtype="float64")
         else:
             X[col] = pd.Series(
                 np.nan_to_num(to_float_array(X[col]), nan=0.0),
@@ -476,7 +562,7 @@ if run:
 
             feats = get_feature_names(model, meta) or DEFAULT_FEATURES
             X, missing = build_X(df, feats)
-            X = encode_X(X)
+            X = encode_X(X, model, meta)
             if X.shape[0] == 0 or X.shape[1] == 0:
                 raise ValueError(f"モデルへの入力が空です（行数={X.shape[0]}, 列数={X.shape[1]}）。")
 
