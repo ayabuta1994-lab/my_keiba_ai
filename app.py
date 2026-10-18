@@ -61,7 +61,7 @@ def _ensure_race_management_sheet(spreadsheet):
         ws = spreadsheet.add_worksheet(title=RACE_MANAGEMENT_SHEET, rows=1000, cols=len(RACE_MANAGEMENT_COLUMNS))
         ws.append_row(RACE_MANAGEMENT_COLUMNS, value_input_option="USER_ENTERED")
         return ws
-    values = ws.get_all_values()
+    values = _cached_sheet_values(spreadsheet.id, ws.title)
     if not values:
         ws.append_row(RACE_MANAGEMENT_COLUMNS, value_input_option="USER_ENTERED")
     elif [str(v).strip() for v in values[0][:len(RACE_MANAGEMENT_COLUMNS)]] != RACE_MANAGEMENT_COLUMNS:
@@ -82,7 +82,7 @@ def _register_race(spreadsheet, df):
         return ""
     rid = _race_id(race_day, venue, race_name, distance)
     ws = _ensure_race_management_sheet(spreadsheet)
-    values = ws.get_all_values()
+    values = _cached_sheet_values(spreadsheet.id, ws.title)
     headers = values[0] if values else RACE_MANAGEMENT_COLUMNS
     existing = values[1:] if len(values) > 1 else []
     for row in existing:
@@ -90,6 +90,7 @@ def _register_race(spreadsheet, df):
         if row[0] == rid:
             return rid
     ws.append_row([rid, race_day, venue, race_name, distance, "予想登録済み", str(len(df)), datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")], value_input_option="USER_ENTERED")
+    _cached_sheet_values.clear()
     return rid
 
 
@@ -101,7 +102,7 @@ def _ensure_results_sheet(spreadsheet):
         ws = spreadsheet.add_worksheet(title=RESULTS_SHEET, rows=5000, cols=len(RESULT_COLUMNS))
         ws.append_row(RESULT_COLUMNS, value_input_option="USER_ENTERED")
         return ws
-    values = ws.get_all_values()
+    values = _cached_sheet_values(spreadsheet.id, ws.title)
     if not values:
         ws.append_row(RESULT_COLUMNS, value_input_option="USER_ENTERED")
     elif [str(v).strip() for v in values[0][:len(RESULT_COLUMNS)]] != RESULT_COLUMNS:
@@ -134,7 +135,7 @@ def _previous_result_lookup(spreadsheet, race_day):
 
 def _load_race_management(spreadsheet):
     ws = _ensure_race_management_sheet(spreadsheet)
-    values = ws.get_all_values()
+    values = _cached_sheet_values(spreadsheet.id, ws.title)
     # One-time/backfill behavior: make older races already stored in predictions selectable too.
     try:
         pred_ws = spreadsheet.worksheet("predictions")
@@ -154,7 +155,7 @@ def _load_race_management(spreadsheet):
                 ws.append_row([rid, race_row["Race Day"], race_row["Venue"], race_row["Race Name"], race_row["Distance"], status, str(len(same_race)), datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")], value_input_option="USER_ENTERED")
                 known_ids.add(rid)
                 seen.add(rid)
-            values = ws.get_all_values()
+            values = _cached_sheet_values(spreadsheet.id, ws.title)
     except Exception:
         # Keep the result screen usable for manually registered rows even if old predictions cannot be read.
         pass
@@ -220,8 +221,22 @@ def _norm_horse(v):
     return re.sub(r"[\s\u200b-\u200f\u2060\ufeff]", "", str(v or ""))
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_sheet_values(spreadsheet_id, worksheet_title):
+    """Cache Google Sheets reads briefly to avoid 429s during Streamlit reruns."""
+    sh = get_gspread_client()
+    return sh.worksheet(worksheet_title).get_all_values()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_worksheet_titles(spreadsheet_id):
+    """Cache worksheet metadata to avoid repeated spreadsheet metadata requests."""
+    sh = get_gspread_client()
+    return [ws.title for ws in sh.worksheets()]
+
+
 def _read_worksheet_dataframe(ws):
-    values = ws.get_all_values()
+    values = _cached_sheet_values(ws.spreadsheet.id, ws.title)
     if not values or len(values) < 2:
         return pd.DataFrame()
     headers = [str(v).strip() for v in values[0]]
@@ -242,7 +257,10 @@ def _read_worksheet_dataframe(ws):
 
 def _load_spreadsheet_history(spreadsheet):
     frames = []
-    for ws in spreadsheet.worksheets():
+    for title in _cached_worksheet_titles(spreadsheet.id):
+        if title in ("horses_master", RACE_MANAGEMENT_SHEET, RESULTS_SHEET):
+            continue
+        ws = spreadsheet.worksheet(title)
         if ws.title in ("horses_master", RACE_MANAGEMENT_SHEET, RESULTS_SHEET):
             continue
         try:
@@ -672,76 +690,82 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🧬 血統データ登録"
 ])
 
-# --- TAB 1: AI予想の実行（スプレッドシート連動型） ---
+# --- TAB 1: AI予想の実行（必要時のみスプレッドシートを読む） ---
 with tab1:
     st.subheader("① 予想対象レースの選択（Googleスプレッドシート連動）")
-    st.caption("※「Tab 3（過去レース一括登録）」等であらかじめスプレッドシートに登録した対象レースのタブを選択してください。")
+    st.caption("スプレッドシートは、利用者が読み込み操作をしたときだけ読み込みます。")
 
-    try:
-        sh = get_gspread_client()
-        ws_list = [ws.title for ws in sh.worksheets() if ws.title not in ("horses_master", RACE_MANAGEMENT_SHEET, RESULTS_SHEET)]
-    except Exception:
-        ws_list = ["predictions"]
-
-    target_eval_ws = st.selectbox("予想するレースのタブを選択", ws_list, key="eval_ws_select")
-
-    # Show a compact editor for previous-race running style. The value is stored in
-    # the existing Tactics column, preserving the fixed 21-column training schema.
-    try:
-        conn_preview = st.connection("gsheets", type=GSheetsConnection)
-        df_preview = conn_preview.read(worksheet=target_eval_ws, ttl=0)
-    except Exception as exc:
-        df_preview = pd.DataFrame()
-        st.warning(f"出走表の読み込みに失敗しました: {exc}")
-
-    if df_preview is not None and not df_preview.empty:
-        preview_df = ensure_21_columns(df_preview).copy()
-        st.markdown("**② 出走馬の前走脚質を入力**")
-        st.caption("脚質は今回のレースでの位置取りではなく、各馬の前走の脚質です。1=逃げ、2=先行、3=差し、4=追込。分からない馬は空欄のままにしてください。")
-        previous_results = _previous_result_lookup(sh, preview_df.iloc[0].get("Race Day", ""))
-        def previous_value(horse_name, field, fallback=""):
-            result = previous_results.get(_norm_horse(horse_name), {})
-            value = result.get(field, "")
-            return value if value not in (None, "", np.nan) else fallback
-        tactics_editor = pd.DataFrame({
-            "Horse Number": preview_df["Horse Number"].astype(str),
-            "Horse Name": preview_df["Horse Name"].astype(str),
-            "Tactics": [previous_value(name, "Tactics", parse_tactics(preview_df.iloc[i]["Tactics"])) for i, name in enumerate(preview_df["Horse Name"].astype(str))],
-            "Last 3F": [previous_value(name, "Last 3F", preview_df.iloc[i]["Last 3F"]) for i, name in enumerate(preview_df["Horse Name"].astype(str))],
-        })
-        edited_tactics = st.data_editor(
-            tactics_editor,
-            hide_index=True,
-            use_container_width=True,
-            key=f"prev_tactics_editor_{target_eval_ws}",
-            column_config={
-                "Horse Number": st.column_config.TextColumn("馬番", disabled=True),
-                "Horse Name": st.column_config.TextColumn("馬名", disabled=True),
-                "Tactics": st.column_config.SelectboxColumn(
-                    "前走脚質コード", options=[1, 2, 3, 4], required=False,
-                    help="結果管理シートに前走実績があれば自動入力。必要に応じて修正できます。1=逃げ / 2=先行 / 3=差し / 4=追込"
-                ),
-                "Last 3F": st.column_config.TextColumn("前走上がり3F", help="前走実績から自動入力。必要に応じて修正できます。"),
-            },
-            disabled=["Horse Number", "Horse Name"],
-        )
-    else:
-        edited_tactics = None
-        st.info(f"「{target_eval_ws}」タブに出走馬データがありません。")
-
-    run = st.button("🔮 前走脚質を反映してAI予想を実行する", type="primary", use_container_width=True)
-
-    if run:
+    if st.button("📋 出走表タブ一覧を読み込む", key="load_eval_tabs"):
         try:
-            if df_preview is None or df_preview.empty:
-                st.warning(f"「{target_eval_ws}」タブにデータがありません。")
-            else:
+            sh = get_gspread_client()
+            st.session_state["eval_ws_list"] = [title for title in _cached_worksheet_titles(sh.id) if title not in ("horses_master", RACE_MANAGEMENT_SHEET, RESULTS_SHEET)]
+            st.session_state.pop("eval_preview_df", None)
+            st.session_state.pop("eval_preview_ws", None)
+            st.success("タブ一覧を読み込みました。予想対象を選択してください。")
+        except Exception as exc:
+            st.error(f"タブ一覧の読み込みに失敗しました: {exc}")
+
+    ws_list = st.session_state.get("eval_ws_list", [])
+    if not ws_list:
+        st.info("まだスプレッドシートを読み込んでいません。「出走表タブ一覧を読み込む」を押してください。")
+    else:
+        target_eval_ws = st.selectbox("予想するレースのタブを選択", ws_list, key="eval_ws_select")
+        if st.button("📥 選択した出走表を読み込む", key="load_eval_entry"):
+            try:
+                conn_preview = st.connection("gsheets", type=GSheetsConnection)
+                df_preview = conn_preview.read(worksheet=target_eval_ws, ttl=30)
+                st.session_state["eval_preview_df"] = df_preview
+                st.session_state["eval_preview_ws"] = target_eval_ws
+                st.session_state.pop("result_df", None)
+                st.success(f"「{target_eval_ws}」を読み込みました。")
+            except Exception as exc:
+                st.error(f"出走表の読み込みに失敗しました: {exc}")
+
+        df_preview = st.session_state.get("eval_preview_df") if st.session_state.get("eval_preview_ws") == target_eval_ws else None
+        sh = None
+        edited_tactics = None
+        if df_preview is not None and not df_preview.empty:
+            preview_df = ensure_21_columns(df_preview).copy()
+            st.markdown("**② 出走馬の前走脚質を入力**")
+            st.caption("脚質は今回のレースでの位置取りではなく、各馬の前走の脚質です。1=逃げ、2=先行、3=差し、4=追込。分からない馬は空欄のままにしてください。")
+            if st.button("🔎 結果管理シートから前走実績を読み込む", key="load_previous_results"):
+                try:
+                    sh_prev = get_gspread_client()
+                    st.session_state["previous_results_lookup"] = _previous_result_lookup(sh_prev, preview_df.iloc[0].get("Race Day", ""))
+                    st.session_state["previous_results_for_ws"] = target_eval_ws
+                    st.success("前走実績を読み込みました。")
+                except Exception as exc:
+                    st.warning(f"前走実績の読み込みに失敗しました: {exc}")
+            previous_results = st.session_state.get("previous_results_lookup", {}) if st.session_state.get("previous_results_for_ws") == target_eval_ws else {}
+            def previous_value(horse_name, field, fallback=""):
+                result = previous_results.get(_norm_horse(horse_name), {})
+                value = result.get(field, "")
+                return value if value not in (None, "", np.nan) else fallback
+            tactics_editor = pd.DataFrame({
+                "Horse Number": preview_df["Horse Number"].astype(str),
+                "Horse Name": preview_df["Horse Name"].astype(str),
+                "Tactics": [previous_value(name, "Tactics", parse_tactics(preview_df.iloc[i]["Tactics"])) for i, name in enumerate(preview_df["Horse Name"].astype(str))],
+                "Last 3F": [previous_value(name, "Last 3F", preview_df.iloc[i]["Last 3F"]) for i, name in enumerate(preview_df["Horse Name"].astype(str))],
+            })
+            edited_tactics = st.data_editor(
+                tactics_editor, hide_index=True, use_container_width=True,
+                key=f"prev_tactics_editor_{target_eval_ws}",
+                column_config={
+                    "Horse Number": st.column_config.TextColumn("馬番", disabled=True),
+                    "Horse Name": st.column_config.TextColumn("馬名", disabled=True),
+                    "Tactics": st.column_config.SelectboxColumn("前走脚質コード", options=[1, 2, 3, 4], required=False,
+                        help="結果管理シートに前走実績があれば自動入力。1=逃げ / 2=先行 / 3=差し / 4=追込"),
+                    "Last 3F": st.column_config.TextColumn("前走上がり3F", help="前走実績から自動入力。必要に応じて修正できます。"),
+                }, disabled=["Horse Number", "Horse Name"])
+
+        run = st.button("🔮 前走脚質を反映してAI予想を実行する", type="primary", use_container_width=True, disabled=(df_preview is None or df_preview.empty or edited_tactics is None))
+        if run:
+            try:
+                sh = get_gspread_client()
                 raw_df = ensure_21_columns(df_preview).copy()
-                # Preserve the true user-entered value before preprocess applies legacy defaults.
                 raw_df["Previous_Tactics_Input"] = edited_tactics["Tactics"].map(parse_tactics).values
                 raw_df["Tactics"] = edited_tactics["Tactics"].values
                 raw_df["Last 3F"] = edited_tactics["Last 3F"].values
-                # Persist the edited codes in column P (the existing Tactics field) of the selected race tab.
                 source_ws = sh.worksheet(target_eval_ws)
                 source_headers = [str(v).strip() for v in source_ws.row_values(1)]
                 if "Tactics" not in source_headers:
@@ -753,14 +777,8 @@ with tab1:
                     source_ws.update(range_name=f"{tactics_col_letter}2:{tactics_col_letter}{len(tactics_values)+1}", values=tactics_values, value_input_option="USER_ENTERED")
                 st.session_state.pop("top3_probabilities", None)
                 now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-
-                defaults_map = {
-                    "Execution Date": now_str,
-                }
-
-                df = preprocess(raw_df, defaults_map)
+                df = preprocess(raw_df, {"Execution Date": now_str})
                 pace = diagnose_pace(df)
-
                 top3_pct = None
                 if isinstance(model, dict) and isinstance(model.get("models"), dict):
                     X = _new_model_matrix(df, model)
@@ -772,120 +790,117 @@ with tab1:
                         raise ValueError("モデルの予測件数と出馬表の頭数が一致しません。")
                     top3_pct = np.round(np.clip(top3_proba, 0, 1) * 100, 1)
                 else:
-                    feats = get_feature_names_custom(model, meta) or [
-                        "Bracket", "Horse Number", "Horse Age", "Burden Weight", "Tactics", "Distance", "Last 3F"
-                    ]
+                    feats = get_feature_names_custom(model, meta) or ["Bracket", "Horse Number", "Horse Age", "Burden Weight", "Tactics", "Distance", "Last 3F"]
                     X, missing = build_X(df, feats)
                     X, hashed = encode_X(X, model, meta)
                     proba = predict_top3(model, X)
-                
                 proba_pct = np.round(np.asarray(proba, dtype=float) * 100, 1)
-
                 df["AI_Probability"] = proba_pct.astype(str)
-                rank_series = pd.Series(proba_pct, index=df.index).rank(ascending=False, method="min").astype(int)
-                df["AI_Rank"] = rank_series.astype(str)
+                df["AI_Rank"] = pd.Series(proba_pct, index=df.index).rank(ascending=False, method="min").astype(int).astype(str)
                 if top3_pct is not None:
                     df["複勝確率(3着以内)"] = top3_pct.astype(str)
-
                 df_sorted = df.sort_values("AI_Probability", key=lambda col: pd.to_numeric(col, errors="coerce"), ascending=False).reset_index(drop=True)
                 out_21 = ensure_21_columns(df_sorted)
-                display_df = df_sorted.copy()
-
                 st.session_state["result_df"] = out_21
-                st.session_state["result_view_df"] = display_df
+                st.session_state["result_view_df"] = df_sorted.copy()
                 st.session_state["pace"] = pace
-
                 ws = sh.worksheet("predictions")
                 ws.append_rows(out_21.values.tolist(), value_input_option="USER_ENTERED")
-                registered_race_id = _register_race(sh, out_21)
-                st.session_state["registered_race_id"] = registered_race_id
+                _cached_sheet_values.clear(); _cached_worksheet_titles.clear()
+                st.session_state["registered_race_id"] = _register_race(sh, out_21)
                 st.session_state["saved"] = True
+                st.success("予測結果を保存しました。")
+            except Exception as e:
+                st.session_state.pop("result_df", None)
+                st.error(f"予想または保存中にエラーが発生しました: {e}")
+                with st.expander("詳細ログ"):
+                    st.code(traceback.format_exc())
 
-        except Exception as e:
-            st.session_state.pop("result_df", None)
-            st.error(f"予想または保存中にエラーが発生しました: {e}")
-            with st.expander("詳細ログ"):
-                st.code(traceback.format_exc())
-
-    if "result_df" in st.session_state:
-        out = st.session_state["result_df"]
-        view_out = st.session_state.get("result_view_df", out)
-        render_pace(st.session_state.get("pace", {"ok": False}))
-
-        st.subheader(f"② AI予想結果（全{len(out)}頭・AI_Rank順）")
-        if "複勝確率(3着以内)" in view_out.columns:
-            st.caption("勝率は単勝モデル、複勝確率は3着以内モデルの予測値です。")
-        
-        view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="pred_view_mode")
-        
-        if view_mode == "📱 スマホ用カード表示":
-            render_cards_prediction(view_out)
-        else:
-            st.dataframe(view_out, hide_index=True, use_container_width=True, height=int(35 * (len(view_out) + 1) + 3))
-
-        if st.session_state.get("saved"):
-            st.success("✨ 予想完了＆ `predictions` タブへの21列データ蓄積が完了しました！")
-            rid = st.session_state.get("registered_race_id", "")
-            if rid:
-                st.caption(f"結果入力用レースID（21列の外で管理）: `{rid}`")
-
+        if "result_df" in st.session_state:
+            out = st.session_state["result_df"]
+            view_out = st.session_state.get("result_view_df", out)
+            render_pace(st.session_state.get("pace", {"ok": False}))
+            st.subheader(f"② AI予想結果（全{len(out)}頭・AI_Rank順）")
+            if "複勝確率(3着以内)" in view_out.columns:
+                st.caption("勝率は単勝モデル、複勝確率は3着以内モデルの予測値です。")
+            view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="pred_view_mode")
+            if view_mode == "📱 スマホ用カード表示": render_cards_prediction(view_out)
+            else: st.dataframe(view_out, hide_index=True, use_container_width=True, height=int(35 * (len(view_out) + 1) + 3))
+            if st.session_state.get("saved"):
+                st.success("✨ 予想完了＆ `predictions` タブへの21列データ蓄積が完了しました！")
+                rid = st.session_state.get("registered_race_id", "")
+                if rid: st.caption(f"結果入力用レースID（21列の外で管理）: `{rid}`")
 
 # --- TAB 2: 過去データ参照 ---
 with tab2:
     st.subheader("📊 過去の予想データ参照（predictions タブ）")
-    if st.button("🔄 データを再読み込み"):
-        st.cache_data.clear()
-
-    try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        df_hist_raw = conn.read(worksheet="predictions", ttl=0)
-        if df_hist_raw is not None and not df_hist_raw.empty:
-            df_hist_raw = df_hist_raw.dropna(how="all").dropna(axis=1, how="all")
-            df_hist = ensure_21_columns(df_hist_raw)
-            
-            with st.expander("🔍 絞り込み・並び替え設定", expanded=True):
-                fc1, fc2, fc3 = st.columns(3)
-                with fc1:
-                    filter_race_name = st.text_input("レース名で検索", placeholder="例: アンタレス")
-                with fc2:
-                    filter_venue = st.multiselect("競馬場で絞り込み", options=list(df_hist["Venue"].dropna().unique()) if "Venue" in df_hist.columns else [])
-                with fc3:
-                    sort_col = st.selectbox("並び替えの基準列", options=list(df_hist.columns), index=0)
-                    ascending = st.radio("昇順/降順", options=["降順（新しい順/高ランク順）", "昇順"], index=0) == "昇順"
-
-            df_filtered = df_hist.copy()
-            if filter_race_name and "Race Name" in df_filtered.columns:
-                df_filtered = df_filtered[df_filtered["Race Name"].astype(str).str.contains(filter_race_name, na=False)]
-            if filter_venue and "Venue" in df_filtered.columns:
-                df_filtered = df_filtered[df_filtered["Venue"].isin(filter_venue)]
-
-            if sort_col in df_filtered.columns:
-                try:
-                    num_series = pd.to_numeric(df_filtered[sort_col], errors="coerce")
-                    if num_series.notna().sum() > 0:
-                        df_filtered["_sort_key"] = num_series
-                        df_filtered = df_filtered.sort_values("_sort_key", ascending=ascending).drop(columns=["_sort_key"])
-                    else:
+    if st.button("📥 predictions を読み込む", key="load_predictions_history"):
+        try:
+            conn = st.connection("gsheets", type=GSheetsConnection)
+            st.session_state["predictions_history_df"] = conn.read(worksheet="predictions", ttl=30)
+            st.success("predictions を読み込みました。")
+        except Exception as e:
+            st.warning(f"読み込みエラー: {e}")
+    if st.button("🔄 キャッシュを破棄して再読み込み", key="reload_predictions_history"):
+        _cached_sheet_values.clear(); _cached_worksheet_titles.clear(); st.cache_data.clear()
+        try:
+            conn = st.connection("gsheets", type=GSheetsConnection)
+            st.session_state["predictions_history_df"] = conn.read(worksheet="predictions", ttl=0)
+            st.success("最新データを読み込みました。")
+        except Exception as e:
+            st.warning(f"読み込みエラー: {e}")
+    df_hist_raw = st.session_state.get("predictions_history_df")
+    if df_hist_raw is None:
+        st.info("まだデータを読み込んでいません。表示したいときに「predictions を読み込む」を押してください。")
+    else:
+        try:
+            if df_hist_raw is not None and not df_hist_raw.empty:
+                df_hist_raw = df_hist_raw.dropna(how="all").dropna(axis=1, how="all")
+                df_hist = ensure_21_columns(df_hist_raw)
+                
+                with st.expander("🔍 絞り込み・並び替え設定", expanded=True):
+                    fc1, fc2, fc3 = st.columns(3)
+                    with fc1:
+                        filter_race_name = st.text_input("レース名で検索", placeholder="例: アンタレス")
+                    with fc2:
+                        filter_venue = st.multiselect("競馬場で絞り込み", options=list(df_hist["Venue"].dropna().unique()) if "Venue" in df_hist.columns else [])
+                    with fc3:
+                        sort_col = st.selectbox("並び替えの基準列", options=list(df_hist.columns), index=0)
+                        ascending = st.radio("昇順/降順", options=["降順（新しい順/高ランク順）", "昇順"], index=0) == "昇順"
+    
+                df_filtered = df_hist.copy()
+                if filter_race_name and "Race Name" in df_filtered.columns:
+                    df_filtered = df_filtered[df_filtered["Race Name"].astype(str).str.contains(filter_race_name, na=False)]
+                if filter_venue and "Venue" in df_filtered.columns:
+                    df_filtered = df_filtered[df_filtered["Venue"].isin(filter_venue)]
+    
+                if sort_col in df_filtered.columns:
+                    try:
+                        num_series = pd.to_numeric(df_filtered[sort_col], errors="coerce")
+                        if num_series.notna().sum() > 0:
+                            df_filtered["_sort_key"] = num_series
+                            df_filtered = df_filtered.sort_values("_sort_key", ascending=ascending).drop(columns=["_sort_key"])
+                        else:
+                            df_filtered = df_filtered.sort_values(sort_col, ascending=ascending)
+                    except Exception:
                         df_filtered = df_filtered.sort_values(sort_col, ascending=ascending)
-                except Exception:
-                    df_filtered = df_filtered.sort_values(sort_col, ascending=ascending)
-
-            df_filtered = df_filtered.reset_index(drop=True)
-            st.success(f"表示中: **{len(df_filtered)} / {len(df_hist)} 件** のデータ")
-
-            filename_pred = f"predictions_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv"
-            link_html_pred = create_safe_download_link(df_filtered, filename_pred, "📥 表示中のデータをCSV保存（スマホ対応）")
-            st.markdown(link_html_pred, unsafe_allow_html=True)
-
-            hist_view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="hist_view_mode")
-            if hist_view_mode == "📱 スマホ用カード表示":
-                render_cards_history(df_filtered)
+    
+                df_filtered = df_filtered.reset_index(drop=True)
+                st.success(f"表示中: **{len(df_filtered)} / {len(df_hist)} 件** のデータ")
+    
+                filename_pred = f"predictions_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv"
+                link_html_pred = create_safe_download_link(df_filtered, filename_pred, "📥 表示中のデータをCSV保存（スマホ対応）")
+                st.markdown(link_html_pred, unsafe_allow_html=True)
+    
+                hist_view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="hist_view_mode")
+                if hist_view_mode == "📱 スマホ用カード表示":
+                    render_cards_history(df_filtered)
+                else:
+                    st.dataframe(df_filtered, use_container_width=True, height=500)
             else:
-                st.dataframe(df_filtered, use_container_width=True, height=500)
-        else:
-            st.info("predictions タブにデータがありません。")
-    except Exception as e:
-        st.warning(f"読み込みエラー: {e}")
+                st.info("predictions タブにデータがありません。")
+        except Exception as e:
+            st.warning(f"読み込みエラー: {e}")
 
 
 # --- TAB 3: 過去レース一括登録 ＆ タブ全データエクスポート ---
@@ -893,34 +908,37 @@ with tab3:
     st.subheader("📥 過去レース結果データ 一括登録 ＆ エクスポート")
     st.caption("スプレッドシートのレース用タブを選択し、データの登録または学習用CSVとしての全件エクスポートが行えます。")
 
-    try:
-        sh = get_gspread_client()
-        ws_list = [ws.title for ws in sh.worksheets() if ws.title not in ("horses_master", RACE_MANAGEMENT_SHEET, RESULTS_SHEET)]
-    except Exception:
-        ws_list = ["predictions"]
-
-    def_idx = ws_list.index("predictions") if "predictions" in ws_list else 0
-    target_ws = st.selectbox("対象タブを選択", ws_list, index=def_idx, key="races_ws")
-
-    with st.expander(f"📥 「{target_ws}」タブの全データをCSV出力する（学習用）", expanded=False):
-        if st.button("🔄 対象タブのデータを取得", key="fetch_target_ws"):
-            st.cache_data.clear()
+    if st.button("📋 登録先タブ一覧を読み込む", key="load_import_tabs"):
         try:
-            conn_t = st.connection("gsheets", type=GSheetsConnection)
-            df_target_all = conn_t.read(worksheet=target_ws, ttl=0)
+            sh = get_gspread_client()
+            st.session_state["import_ws_list"] = [title for title in _cached_worksheet_titles(sh.id) if title not in ("horses_master", RACE_MANAGEMENT_SHEET, RESULTS_SHEET)]
+        except Exception as exc:
+            st.error(f"タブ一覧の読み込みに失敗しました: {exc}")
+    ws_list = st.session_state.get("import_ws_list", [])
+    target_ws = None
+    if ws_list:
+        def_idx = ws_list.index("predictions") if "predictions" in ws_list else 0
+        target_ws = st.selectbox("対象タブを選択", ws_list, index=def_idx, key="races_ws")
+        if st.button("📥 選択したタブの全データを取得", key="fetch_target_ws"):
+            try:
+                conn_t = st.connection("gsheets", type=GSheetsConnection)
+                st.session_state["target_export_df"] = conn_t.read(worksheet=target_ws, ttl=30)
+                st.session_state["target_export_ws"] = target_ws
+            except Exception as exc:
+                st.error(f"読み込みエラー: {exc}")
+        if st.session_state.get("target_export_ws") == target_ws and st.session_state.get("target_export_df") is not None:
+            df_target_all = st.session_state["target_export_df"]
             if df_target_all is not None and not df_target_all.empty:
                 df_target_all = df_target_all.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
                 df_target_clean = ensure_21_columns(df_target_all)
                 st.info(f"「{target_ws}」タブから全 **{len(df_target_clean)} 件** のデータを読み込みました。")
-                
                 filename_target = f"{target_ws}_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv"
-                link_html_target = create_safe_download_link(df_target_clean, filename_target, f"📥 {target_ws} をCSV保存（スマホ対応）")
-                st.markdown(link_html_target, unsafe_allow_html=True)
+                st.markdown(create_safe_download_link(df_target_clean, filename_target, f"📥 {target_ws} をCSV保存（スマホ対応）"), unsafe_allow_html=True)
                 st.dataframe(df_target_clean, use_container_width=True, height=200)
             else:
                 st.info(f"「{target_ws}」タブにデータがありません。")
-        except Exception as e:
-            st.warning(f"読み込みエラー: {e}")
+    else:
+        st.info("スプレッドシートを読み込んでいません。「登録先タブ一覧を読み込む」を押してください。")
 
     st.markdown("---")
     st.subheader("📝 過去レースデータのテキスト一括登録")
@@ -937,11 +955,14 @@ with tab3:
             st.success(f"解析成功: **{len(df_r)} 行**（書き込み先: **{target_ws}**）")
             st.dataframe(df_r, use_container_width=True)
 
-            if st.button(f"🚀 「{target_ws}」タブに21列データを一括書き込み", type="primary"):
+            if target_ws and st.button(f"🚀 「{target_ws}」タブに21列データを一括書き込み", type="primary"):
                 with st.spinner("書き込み中..."):
-                    worksheet = sh.worksheet(target_ws)
+                    sh_write = get_gspread_client()
+                    worksheet = sh_write.worksheet(target_ws)
                     clean_rows = df_r.fillna("").astype(str).values.tolist()
                     worksheet.append_rows(clean_rows, value_input_option="USER_ENTERED")
+                    _cached_sheet_values.clear()
+                    _cached_worksheet_titles.clear()
                     st.balloons()
                     st.success(f"🎉 正常に {len(df_r)} 件のデータが追加されました！")
         except Exception as e:
@@ -951,89 +972,106 @@ with tab3:
     st.markdown("---")
     st.subheader("🏁 レースを選択して結果を登録")
     st.caption("実際の脚質・上がり3F・着順は race_results に保存します。predictions の21列とAI予測値は変更しません。次走の予測入力では、日付が前の最新結果を前走実績として自動参照します。")
-    try:
-        sh_results = get_gspread_client()
-        registry_ws, registry_df = _load_race_management(sh_results)
-        if registry_df.empty:
-            st.info("まだレース管理データがありません。先に出走表からAI予想を実行してください。")
-        else:
-            labels = [_race_display_label(row) for _, row in registry_df.iterrows()]
-            label_to_index = {label: i for i, label in enumerate(labels)}
-            chosen_label = st.selectbox("結果を登録するレース", labels, key="result_race_select")
-            chosen = registry_df.iloc[label_to_index[chosen_label]]
-            st.caption(f"管理用レースID: `{chosen['Race ID']}` ／ 状態: {chosen['Status'] or '未登録'}")
-            result_text = st.text_area(
-                "結果データ（TSV / CSV）",
-                height=200,
-                key="race_result_text",
-                placeholder="Horse Number\tHorse Name\tTactics\tLast 3F\tPlacing\n1\tサンプルホースA\t2\t34.5\t1\n2\tサンプルホースB\t3\t35.1\t2"
-            )
-            if result_text.strip():
-                sep = "\t" if "\t" in result_text.splitlines()[0] else ","
-                result_df = pd.read_csv(StringIO(result_text.strip().lstrip("\ufeff")), sep=sep, dtype=str, keep_default_na=False, engine="python")
-                result_df.columns = [str(c).strip() for c in result_df.columns]
-                aliases = {"馬番": "Horse Number", "馬名": "Horse Name", "脚質": "Tactics", "前走脚質": "Tactics", "上がり3F": "Last 3F", "上がり": "Last 3F", "着順": "Placing", "順位": "Placing"}
-                result_df = result_df.rename(columns={c: aliases.get(c, c) for c in result_df.columns})
-                required = ["Horse Number", "Horse Name", "Tactics", "Last 3F", "Placing"]
-                if not all(c in result_df.columns for c in required):
-                    st.error("ヘッダーは Horse Number / Horse Name / Tactics / Last 3F / Placing（または 馬番 / 馬名 / 脚質 / 上がり3F / 着順）にしてください。")
-                else:
-                    result_df = result_df[required].fillna("").astype(str)
-                    st.dataframe(result_df, use_container_width=True)
-                    if st.button("選択したレースの実績を保存", type="primary", key="apply_race_results"):
-                        results_ws = _ensure_results_sheet(sh_results)
-                        current = results_ws.get_all_values()
-                        headers = current[0]
-                        idx = {c: headers.index(c) for c in RESULT_COLUMNS}
-                        existing = current[1:]
-                        row_map = {}
-                        for sheet_row_num, row in enumerate(existing, start=2):
-                            row = row + [""] * max(0, len(headers) - len(row))
-                            key = (row[idx["Race ID"]], row[idx["Horse Number"]], _norm_horse(row[idx["Horse Name"]]))
-                            row_map[key] = sheet_row_num
-                        updates, appends = [], []
-                        now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-                        for _, rr in result_df.iterrows():
-                            if not rr["Horse Number"].strip() or not rr["Horse Name"].strip():
-                                continue
-                            key = (str(chosen["Race ID"]), rr["Horse Number"].strip(), _norm_horse(rr["Horse Name"]))
-                            values = [str(chosen["Race ID"]), str(chosen["Race Day"]), str(chosen["Venue"]), str(chosen["Race Name"]), str(chosen["Distance"]), rr["Horse Number"].strip(), rr["Horse Name"].strip(), rr["Tactics"].strip(), rr["Last 3F"].strip(), rr["Placing"].strip(), now]
-                            if key in row_map:
-                                updates.append({"range": f"A{row_map[key]}:K{row_map[key]}", "values": [values]})
+    if st.button("📋 結果登録対象のレース一覧を読み込む", key="load_result_races"):
+        try:
+            sh_results = get_gspread_client()
+            registry_ws, registry_df = _load_race_management(sh_results)
+            st.session_state["race_registry_df"] = registry_df
+            st.session_state["race_registry_loaded"] = True
+        except Exception as exc:
+            st.error(f"レース一覧の読み込みに失敗しました: {exc}")
+    if not st.session_state.get("race_registry_loaded"):
+        st.info("レース一覧は自動では読み込みません。結果登録を行うときに上のボタンを押してください。")
+    else:
+        try:
+            sh_results = get_gspread_client()
+            registry_ws = sh_results.worksheet(RACE_MANAGEMENT_SHEET)
+            registry_df = st.session_state.get("race_registry_df", pd.DataFrame(columns=RACE_MANAGEMENT_COLUMNS))
+            if registry_df.empty:
+                st.info("まだレース管理データがありません。先に出走表からAI予想を実行してください。")
+            else:
+                labels = [_race_display_label(row) for _, row in registry_df.iterrows()]
+                label_to_index = {label: i for i, label in enumerate(labels)}
+                chosen_label = st.selectbox("結果を登録するレース", labels, key="result_race_select")
+                chosen = registry_df.iloc[label_to_index[chosen_label]]
+                st.caption(f"管理用レースID: `{chosen['Race ID']}` ／ 状態: {chosen['Status'] or '未登録'}")
+                result_text = st.text_area(
+                    "結果データ（TSV / CSV）",
+                    height=200,
+                    key="race_result_text",
+                    placeholder="Horse Number\tHorse Name\tTactics\tLast 3F\tPlacing\n1\tサンプルホースA\t2\t34.5\t1\n2\tサンプルホースB\t3\t35.1\t2"
+                )
+                if result_text.strip():
+                    sep = "\t" if "\t" in result_text.splitlines()[0] else ","
+                    result_df = pd.read_csv(StringIO(result_text.strip().lstrip("\ufeff")), sep=sep, dtype=str, keep_default_na=False, engine="python")
+                    result_df.columns = [str(c).strip() for c in result_df.columns]
+                    aliases = {"馬番": "Horse Number", "馬名": "Horse Name", "脚質": "Tactics", "前走脚質": "Tactics", "上がり3F": "Last 3F", "上がり": "Last 3F", "着順": "Placing", "順位": "Placing"}
+                    result_df = result_df.rename(columns={c: aliases.get(c, c) for c in result_df.columns})
+                    required = ["Horse Number", "Horse Name", "Tactics", "Last 3F", "Placing"]
+                    if not all(c in result_df.columns for c in required):
+                        st.error("ヘッダーは Horse Number / Horse Name / Tactics / Last 3F / Placing（または 馬番 / 馬名 / 脚質 / 上がり3F / 着順）にしてください。")
+                    else:
+                        result_df = result_df[required].fillna("").astype(str)
+                        st.dataframe(result_df, use_container_width=True)
+                        if st.button("選択したレースの実績を保存", type="primary", key="apply_race_results"):
+                            results_ws = _ensure_results_sheet(sh_results)
+                            current = _cached_sheet_values(sh_results.id, results_ws.title)
+                            headers = current[0]
+                            idx = {c: headers.index(c) for c in RESULT_COLUMNS}
+                            existing = current[1:]
+                            row_map = {}
+                            for sheet_row_num, row in enumerate(existing, start=2):
+                                row = row + [""] * max(0, len(headers) - len(row))
+                                key = (row[idx["Race ID"]], row[idx["Horse Number"]], _norm_horse(row[idx["Horse Name"]]))
+                                row_map[key] = sheet_row_num
+                            updates, appends = [], []
+                            now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+                            for _, rr in result_df.iterrows():
+                                if not rr["Horse Number"].strip() or not rr["Horse Name"].strip():
+                                    continue
+                                key = (str(chosen["Race ID"]), rr["Horse Number"].strip(), _norm_horse(rr["Horse Name"]))
+                                values = [str(chosen["Race ID"]), str(chosen["Race Day"]), str(chosen["Venue"]), str(chosen["Race Name"]), str(chosen["Distance"]), rr["Horse Number"].strip(), rr["Horse Name"].strip(), rr["Tactics"].strip(), rr["Last 3F"].strip(), rr["Placing"].strip(), now]
+                                if key in row_map:
+                                    updates.append({"range": f"A{row_map[key]}:K{row_map[key]}", "values": [values]})
+                                else:
+                                    appends.append(values)
+                            if not updates and not appends:
+                                st.error("保存対象がありません。馬番と馬名を確認してください。")
                             else:
-                                appends.append(values)
-                        if not updates and not appends:
-                            st.error("保存対象がありません。馬番と馬名を確認してください。")
-                        else:
-                            if updates:
-                                results_ws.batch_update(updates, value_input_option="USER_ENTERED")
-                            if appends:
-                                results_ws.append_rows(appends, value_input_option="USER_ENTERED")
-                            reg_values = registry_ws.get_all_values()
-                            reg_headers = reg_values[0]
-                            rid_col = reg_headers.index("Race ID")
-                            status_col = reg_headers.index("Status")
-                            for reg_row_num, reg_row in enumerate(reg_values[1:], start=2):
-                                reg_row = reg_row + [""] * max(0, len(reg_headers) - len(reg_row))
-                                if reg_row[rid_col] == chosen["Race ID"]:
-                                    status_letter = gspread.utils.rowcol_to_a1(1, status_col + 1).rstrip("1")
-                                    registry_ws.update_acell(f"{status_letter}{reg_row_num}", "結果登録済み")
-                                    break
-                            st.success(f"実績を保存しました（更新 {len(updates)} 行・新規 {len(appends)} 行）。predictions の21列とAI予測値は変更していません。")
-    except Exception as exc:
-        st.warning(f"レース結果入力画面の読み込みエラー: {exc}")
-
+                                if updates:
+                                    results_ws.batch_update(updates, value_input_option="USER_ENTERED")
+                                if appends:
+                                    results_ws.append_rows(appends, value_input_option="USER_ENTERED")
+                                _cached_sheet_values.clear()
+                                _cached_worksheet_titles.clear()
+                                reg_values = _cached_sheet_values(sh_results.id, registry_ws.title)
+                                reg_headers = reg_values[0]
+                                rid_col = reg_headers.index("Race ID")
+                                status_col = reg_headers.index("Status")
+                                for reg_row_num, reg_row in enumerate(reg_values[1:], start=2):
+                                    reg_row = reg_row + [""] * max(0, len(reg_headers) - len(reg_row))
+                                    if reg_row[rid_col] == chosen["Race ID"]:
+                                        status_letter = gspread.utils.rowcol_to_a1(1, status_col + 1).rstrip("1")
+                                        registry_ws.update_acell(f"{status_letter}{reg_row_num}", "結果登録済み")
+                                        _cached_sheet_values.clear()
+                                        break
+                                st.success(f"実績を保存しました（更新 {len(updates)} 行・新規 {len(appends)} 行）。predictions の21列とAI予測値は変更していません。")
+        except Exception as exc:
+            st.warning(f"レース結果入力画面の読み込みエラー: {exc}")
 # --- TAB 4: 血統データ登録 ＆ CSVダウンロード ---
 with tab4:
     st.subheader("🧬 血統データ管理（horses_master 専用）")
     st.caption("血統データ（馬名・父・母父）の登録および学習用CSVダウンロードが行えます。")
 
     with st.expander("📥 登録済みの血統データをCSVダウンロード", expanded=False):
-        if st.button("🔄 血統データを読み込む"):
-            st.cache_data.clear()
-        try:
-            conn_h = st.connection("gsheets", type=GSheetsConnection)
-            df_horses_hist = conn_h.read(worksheet="horses_master", ttl=0)
+        if st.button("📥 血統データを読み込む", key="load_horses_history"):
+            try:
+                conn_h = st.connection("gsheets", type=GSheetsConnection)
+                st.session_state["horses_history_df"] = conn_h.read(worksheet="horses_master", ttl=30)
+            except Exception as exc:
+                st.warning(f"血統データの読み込みエラー: {exc}")
+        df_horses_hist = st.session_state.get("horses_history_df")
+        if df_horses_hist is not None:
             if df_horses_hist is not None and not df_horses_hist.empty:
                 df_horses_hist = df_horses_hist.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
                 for c in COLUMNS_HORSES:
@@ -1050,8 +1088,6 @@ with tab4:
                 st.dataframe(df_horses_hist, use_container_width=True, height=250)
             else:
                 st.info("horses_master タブにデータがありません。")
-        except Exception as e:
-            st.warning(f"血統データの読み込みエラー: {e}")
 
     st.markdown("---")
     st.subheader("🧬 血統データ一括登録")
