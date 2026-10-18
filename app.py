@@ -446,6 +446,8 @@ def render_cards_prediction(df: pd.DataFrame):
             with col_right:
                 st.metric("AI順位", f"{rank}位")
                 st.metric("勝率", f"{prob}%")
+                if "複勝確率(3着以内)" in row.index:
+                    st.metric("複勝確率（3着以内）", f"{row.get('複勝確率(3着以内)', '-')}%")
 
 
 def render_cards_history(df: pd.DataFrame):
@@ -542,13 +544,17 @@ with tab1:
                 df = preprocess(raw_df, defaults_map)
                 pace = diagnose_pace(df)
 
+                top3_pct = None
                 if isinstance(model, dict) and isinstance(model.get("models"), dict):
-                    # 学習済みの23特徴量・保存済みカテゴリ辞書を使い、勝率モデルで順位付けする。
+                    # 学習済みの特徴量順・カテゴリ辞書を使い、単勝/複勝を別々に予測する。
                     X = _new_model_matrix(df, model)
-                    proba = np.asarray(model["models"]["win"].predict(X, num_iteration=getattr(model["models"]["win"], "best_iteration", None)), dtype=float)
-                    # 複勝（3着以内）モデルも同じ入力で計算し、結果診断用に保持。
-                    top3_proba = np.asarray(model["models"]["top3"].predict(X, num_iteration=getattr(model["models"]["top3"], "best_iteration", None)), dtype=float)
-                    st.session_state["top3_probabilities"] = np.round(top3_proba * 100, 1).tolist()
+                    win_model = model["models"]["win"]
+                    top3_model = model["models"]["top3"]
+                    proba = np.asarray(win_model.predict(X, num_iteration=getattr(win_model, "best_iteration", None)), dtype=float)
+                    top3_proba = np.asarray(top3_model.predict(X, num_iteration=getattr(top3_model, "best_iteration", None)), dtype=float)
+                    if len(proba) != len(df) or len(top3_proba) != len(df):
+                        raise ValueError("モデルの予測件数と出馬表の頭数が一致しません。")
+                    top3_pct = np.round(np.clip(top3_proba, 0, 1) * 100, 1)
                 else:
                     feats = get_feature_names_custom(model, meta) or [
                         "Bracket", "Horse Number", "Horse Age", "Burden Weight", "Tactics", "Distance", "Last 3F"
@@ -559,13 +565,18 @@ with tab1:
                 proba_pct = np.round(np.asarray(proba, dtype=float) * 100, 1)
 
                 df["AI_Probability"] = proba_pct.astype(str)
-                rank_series = pd.Series(proba_pct).rank(ascending=False, method="min").astype(int)
+                rank_series = pd.Series(proba_pct, index=df.index).rank(ascending=False, method="min").astype(int)
                 df["AI_Rank"] = rank_series.astype(str)
+                # 複勝確率は画面表示専用。Google Sheets/CSVに保存する21列スキーマは変更しない。
+                if top3_pct is not None:
+                    df["複勝確率(3着以内)"] = top3_pct.astype(str)
 
-                df_sorted = df.sort_values("AI_Probability", ascending=False).reset_index(drop=True)
+                df_sorted = df.sort_values("AI_Probability", key=lambda col: pd.to_numeric(col, errors="coerce"), ascending=False).reset_index(drop=True)
                 out_21 = ensure_21_columns(df_sorted)
+                display_df = df_sorted.copy()
 
                 st.session_state["result_df"] = out_21
+                st.session_state["result_view_df"] = display_df
                 st.session_state["pace"] = pace
 
                 sh = get_gspread_client()
@@ -580,17 +591,20 @@ with tab1:
                     st.code(traceback.format_exc())
 
     if "result_df" in st.session_state:
-        out = st.session_state["result_df"]
+        out = st.session_state["result_df"]  # 保存・CSV用の21列データ
+        view_out = st.session_state.get("result_view_df", out)  # 画面表示専用の補助列を含む
         render_pace(st.session_state.get("pace", {"ok": False}))
 
         st.subheader(f"④ AI予想結果（全{len(out)}頭・AI_Rank順）")
+        if "複勝確率(3着以内)" in view_out.columns:
+            st.caption("勝率は単勝モデル、複勝確率は3着以内モデルの予測値です。複勝確率は画面表示のみで、保存データの21列形式は維持します。")
         
         view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="pred_view_mode")
         
         if view_mode == "📱 スマホ用カード表示":
-            render_cards_prediction(out)
+            render_cards_prediction(view_out)
         else:
-            st.dataframe(out, hide_index=True, use_container_width=True, height=int(35 * (len(out) + 1) + 3))
+            st.dataframe(view_out, hide_index=True, use_container_width=True, height=int(35 * (len(view_out) + 1) + 3))
 
         if st.session_state.get("saved"):
             st.success("✨ 予想完了＆ `predictions` タブへの21列データ蓄積が完了しました！")
