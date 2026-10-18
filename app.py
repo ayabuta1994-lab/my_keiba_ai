@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-🏇 自分専用 競馬予想AI（オールインワン版・タブ並び順調整済み）
+🏇 自分専用 競馬予想AI（オールインワン版・血統マスタ簡素化）
 - AI予想実行 & predictionsへの自動保存
 - 過去データ参照（AI予想の隣）
 - 過去レースデータ一括登録（タブ選択可・血統タブ除外）
-- 血統データ一括登録（horses_master専用）
+- 血統データ一括登録（horses_master専用：馬名・父・母父のみ）
 """
 import io
 import pickle
@@ -53,8 +53,9 @@ COLUMNS_PREDICTIONS = [
     "Rank", "Horse Number", "Horse Name", "Sire", "Dam's Sire", "Tactics", "AI Probability"
 ]
 
+# 血統マスタ（horses_master）用：馬名・父・母父のみに限定
 COLUMNS_HORSES = [
-    "Horse Name", "Sex", "Birth Year", "Sire", "Dam's Sire", "Trainer", "Owner", "Note"
+    "Horse Name", "Sire", "Dam's Sire"
 ]
 
 
@@ -334,7 +335,7 @@ except Exception as e:
     st.error(f"モデルの読み込みに失敗しました: {e}")
     st.stop()
 
-# タブの定義（「過去データ参照」を「AI予想の実行」の隣に配置）
+# タブの定義
 tab1, tab2, tab3, tab4 = st.tabs([
     "🔮 AI予想の実行", 
     "📊 過去データ参照", 
@@ -414,7 +415,6 @@ with tab1:
                 log.insert(8, "High Pace Prob", pace.get("high_prob", ""))
                 log.insert(9, "Front Ratio", pace.get("front_ratio", ""))
 
-                # predictions タブへ自動保存
                 sh = get_gspread_client()
                 ws = sh.worksheet("predictions")
                 ws.append_rows(log.values.tolist(), value_input_option="USER_ENTERED")
@@ -441,7 +441,7 @@ with tab1:
             st.success("✨ 予想完了＆ `predictions` タブへのデータ蓄積が完了しました！")
 
 
-# --- TAB 2: 過去データ参照（AI予想の隣） ---
+# --- TAB 2: 過去データ参照 ---
 with tab2:
     st.subheader("📊 過去の予想データ参照（predictions タブ）")
     if st.button("🔄 データを再読み込み"):
@@ -503,16 +503,16 @@ with tab3:
             st.error(f"データの解析または書き込みに失敗しました: {e}")
 
 
-# --- TAB 4: 血統データ登録 ---
+# --- TAB 4: 血統データ登録（馬名・父・母父のみ） ---
 with tab4:
-    st.subheader("🧬 血統・馬マスタデータ一括登録（horses_master 専用）")
-    st.caption("競走馬の血統マスタデータを `horses_master` タブへ一括登録します。")
+    st.subheader("🧬 血統データ一括登録（horses_master 専用）")
+    st.caption("馬名・父・母父の3項目のみを `horses_master` タブへ一括登録します。")
 
     raw_horses = st.text_area(
         "血統データの貼り付け（TSV / CSV）",
         height=220,
         key="horses_text",
-        placeholder="Horse Name\tSex\tBirth Year\tSire\tDam's Sire\tTrainer\tOwner\tNote\nサンプルホース\t牡\t2020\tドゥラメンテ\tサンデーサイレンス\t友道\tサンデーR\t特記事項"
+        placeholder="Horse Name\tSire\tDam's Sire\nサンプルホース\tドゥラメンテ\tサンデーサイレンス"
     )
 
     if raw_horses.strip():
