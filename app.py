@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-🏇 自分専用 競馬予想AI（オールインワン版・過去データタブ全件エクスポート対応）
-- 過去データ入力タブ（Tab 3）に、選択したタブの全データを丸ごとCSV出力する機能を追加
-- スマホ通信エラー対策、カード表示、CSV安全ダウンロード、自動クレンジング、ペース診断、モデル前処理を完全維持
+🏇 自分専用 競馬予想AI（オールインワン版・スプレッドシート連動シンプル予想対応）
+- 共通条件を選び、スプレッドシートの対象レースタブを選択してワンクリックで予想を実行
 """
 import base64
 import io
@@ -60,13 +59,11 @@ def load_model():
     with open(MODEL_PATH, "rb") as f:
         obj = pickle.load(f)
 
-    # 新しい学習スクリプトが出力する win/top3 のモデル束をそのまま保持する。
     if isinstance(obj, dict) and isinstance(obj.get("models"), dict):
         if not all(k in obj["models"] for k in ("win", "top3")):
-            raise ValueError("model.pkl の models に win / top3 がありません。Kaggleで最新の train_model.py を再実行してください。")
+            raise ValueError("model.pkl の models に win / top3 がありません。")
         return obj, {"bundle": obj, "features": list(obj.get("features", [])), "encoders": obj.get("encoders", {})}
 
-    # 旧モデルとの後方互換性（新しい学習モデル利用時は上の分岐）。
     meta = {"features": None, "encoders": {}}
     model = obj
     if isinstance(obj, dict):
@@ -92,14 +89,12 @@ def _norm_horse(v):
 
 
 def _read_worksheet_dataframe(ws):
-    """Googleスプレッドシートの1タブをヘッダー付きDataFrameとして読む。"""
     values = ws.get_all_values()
     if not values or len(values) < 2:
         return pd.DataFrame()
     headers = [str(v).strip() for v in values[0]]
     if not any(headers):
         return pd.DataFrame()
-    # 末尾の空ヘッダーを除き、行の長さをヘッダーに合わせる。
     while headers and not headers[-1]:
         headers.pop()
     if not headers:
@@ -114,7 +109,6 @@ def _read_worksheet_dataframe(ws):
 
 
 def _load_spreadsheet_history(spreadsheet):
-    """過去戦績はGoogle Sheets上のレースデータタブからのみ取得する。"""
     frames = []
     for ws in spreadsheet.worksheets():
         if ws.title == "horses_master":
@@ -122,7 +116,6 @@ def _load_spreadsheet_history(spreadsheet):
         try:
             part = _read_worksheet_dataframe(ws)
         except Exception as exc:
-            # 無関係な空タブ等はスキップするが、読み取り対象の戦績タブで失敗した場合は通知する。
             raise RuntimeError(f"スプレッドシートの「{ws.title}」タブを読み込めません: {exc}") from exc
         if part.empty or "Horse Name" not in part.columns:
             continue
@@ -139,7 +132,6 @@ def _new_model_matrix(df, bundle):
     numeric = set(bundle.get("numeric_features", []))
     categorical = set(bundle.get("categorical_features", []))
     encoders = bundle.get("encoders", {})
-    # 過去戦績・血統情報はGoogleスプレッドシートのみを参照する。
     spreadsheet = get_gspread_client()
     hist = _load_spreadsheet_history(spreadsheet)
     hist = ensure_21_columns(hist).drop_duplicates(
@@ -150,11 +142,10 @@ def _new_model_matrix(df, bundle):
     hist["_last3f"] = to_number(hist["Last 3F"])
     hist["_tactics"] = hist["Tactics"].map(parse_tactics)
 
-    # 血統マスタは Google Sheets の horses_master タブだけを参照する。
     try:
         horses_ws = spreadsheet.worksheet("horses_master")
     except Exception as exc:
-        raise RuntimeError("Googleスプレッドシートに「horses_master」タブがありません。血統マスタ用タブを作成してください。") from exc
+        raise RuntimeError("Googleスプレッドシートに「horses_master」タブがありません。") from exc
     shorses = _read_worksheet_dataframe(horses_ws)
     pedigree = {}
     if not shorses.empty and "Horse Name" in shorses.columns:
@@ -253,17 +244,6 @@ def ensure_21_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[COLUMNS_21].fillna("").astype(str).copy()
 
 
-def parse_input_table(text: str) -> pd.DataFrame:
-    text = text.strip().replace("```csv", "").replace("```", "").replace("\u3000", " ").strip()
-    if not text:
-        raise ValueError("入力データが空です。")
-    first = text.splitlines()[0]
-    sep = "\t" if "\t" in first else ","
-    
-    df = pd.read_csv(StringIO(text), sep=sep, dtype=str, skipinitialspace=True, on_bad_lines="skip")
-    return ensure_21_columns(df)
-
-
 def parse_tactics(v):
     if pd.isna(v) or v is None:
         return np.nan
@@ -303,8 +283,9 @@ def preprocess(df: pd.DataFrame, default_values: dict) -> pd.DataFrame:
     code = df["Tactics"].map(parse_tactics)
     df["TacticsCode"] = code
     df["脚質ラベル"] = code.map(lambda x: TACTICS_LABEL.get(int(x), "不明") if pd.notna(x) else "不明")
-    med = code.median()
-    df["Tactics"] = code.fillna(med if pd.notna(med) else 2.0).astype(float)
+    numeric_code = pd.to_numeric(code, errors="coerce")
+    med = numeric_code.median()
+    df["Tactics"] = numeric_code.fillna(med if pd.notna(med) else 2.0).astype(float)
 
     for c in STR_COLS:
         if c in df.columns:
@@ -400,21 +381,12 @@ def encode_X(X, model, meta):
 
 
 def predict_top3(model, X) -> np.ndarray:
-    # X を .values に変換して LightGBM の厳格なカテゴリ型チェックを回避
     X_val = X.values if hasattr(X, "values") else X
-
-    if hasattr(model, "predict_proba"):
-        p = np.asarray(model.predict_proba(X_val))
-        if p.ndim == 2:
-            classes = getattr(model, "classes_", None)
-            idx = p.shape[1] - 1
-            if classes is not None:
-                cl = list(classes)
-                if 1 in cl:
-                    idx = cl.index(1)
-            return p[:, idx]
-        return p
-    return np.clip(np.asarray(model.predict(X_val), dtype=float), 0, 1)
+    try:
+        preds = model.predict(X_val, predict_disable_shape_check=True)
+    except TypeError:
+        preds = model.predict(X_val)
+    return np.clip(np.asarray(preds, dtype=float), 0, 1)
 
 
 def get_feature_names_custom(model, meta):
@@ -515,46 +487,35 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🧬 血統データ登録"
 ])
 
-# --- TAB 1: AI予想の実行 ---
+# --- TAB 1: AI予想の実行（スプレッドシート連動型） ---
 with tab1:
-    st.subheader("① 共通レース条件（未入力時の自動補完用）")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        default_race_day = st.date_input("レース開催日（Race Day）", datetime.now(JST))
-        default_venue = st.selectbox("競馬場（Venue）", VENUES, index=VENUES.index("阪神"))
-    with c2:
-        default_track_type = st.selectbox("コース種別", ["ダート", "芝", "障害"])
-        default_distance = st.number_input("距離（Distance）", value=1800, step=100)
-    with c3:
-        default_track_cond = st.selectbox("馬場状態（Track Condition）", TRACKS)
-        default_weather = st.selectbox("天気（Weather）", WEATHERS)
+    st.subheader("① 予想対象レースの選択（Googleスプレッドシート連動）")
+    st.caption("※「Tab 3（過去レース一括登録）」等であらかじめスプレッドシートに登録した対象レースのタブを選択してください。")
 
-    default_race_name = st.text_input("レース名（Race Name）", placeholder="例：アンタレスステークス")
+    try:
+        sh = get_gspread_client()
+        ws_list = [ws.title for ws in sh.worksheets() if ws.title != "horses_master"]
+    except Exception:
+        ws_list = ["predictions"]
 
-    st.subheader("② 出馬表（21列フォーマット）の貼り付け")
-    st.caption("※21列の固定TSV/CSVテキストを貼り付けてください。共通条件は空欄部分に自動補完されます。")
-    csv_text = st.text_area("21列データテキスト", height=200, placeholder="\t".join(COLUMNS_21))
+    target_eval_ws = st.selectbox("予想するレースのタブを選択", ws_list, key="eval_ws_select")
 
-    run = st.button("🔮 AI予想を実行する", type="primary", use_container_width=True)
+    run = st.button("🔮 選択したタブのデータでAI予想を実行する", type="primary", use_container_width=True)
 
     if run:
-        if not csv_text.strip():
-            st.warning("出馬表データを貼り付けてください。")
-        else:
-            try:
-                raw_df = parse_input_table(csv_text)
+        try:
+            conn_eval = st.connection("gsheets", type=GSheetsConnection)
+            df_target_raw = conn_eval.read(worksheet=target_eval_ws, ttl=0)
+            
+            if df_target_raw is None or df_target_raw.empty:
+                st.warning(f"「{target_eval_ws}」タブにデータがありません。")
+            else:
+                raw_df = ensure_21_columns(df_target_raw)
                 st.session_state.pop("top3_probabilities", None)
                 now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
                 defaults_map = {
                     "Execution Date": now_str,
-                    "Race Day": str(default_race_day),
-                    "Race Name": default_race_name,
-                    "Venue": default_venue,
-                    "Distance": str(default_distance),
-                    "Track Condition": default_track_cond,
-                    "Weather": default_weather,
-                    "Track_Type": TRACK_TYPES.get(default_track_type, "1")
                 }
 
                 df = preprocess(raw_df, defaults_map)
@@ -562,7 +523,6 @@ with tab1:
 
                 top3_pct = None
                 if isinstance(model, dict) and isinstance(model.get("models"), dict):
-                    # 学習済みの特徴量順・カテゴリ辞書を使い、単勝/複勝を別々に予測する。
                     X = _new_model_matrix(df, model)
                     win_model = model["models"]["win"]
                     top3_model = model["models"]["top3"]
@@ -578,12 +538,12 @@ with tab1:
                     X, missing = build_X(df, feats)
                     X, hashed = encode_X(X, model, meta)
                     proba = predict_top3(model, X)
+                
                 proba_pct = np.round(np.asarray(proba, dtype=float) * 100, 1)
 
                 df["AI_Probability"] = proba_pct.astype(str)
                 rank_series = pd.Series(proba_pct, index=df.index).rank(ascending=False, method="min").astype(int)
                 df["AI_Rank"] = rank_series.astype(str)
-                # 複勝確率は画面表示専用。Google Sheets/CSVに保存する21列スキーマは変更しない。
                 if top3_pct is not None:
                     df["複勝確率(3着以内)"] = top3_pct.astype(str)
 
@@ -595,25 +555,24 @@ with tab1:
                 st.session_state["result_view_df"] = display_df
                 st.session_state["pace"] = pace
 
-                sh = get_gspread_client()
                 ws = sh.worksheet("predictions")
                 ws.append_rows(out_21.values.tolist(), value_input_option="USER_ENTERED")
                 st.session_state["saved"] = True
 
-            except Exception as e:
-                st.session_state.pop("result_df", None)
-                st.error(f"予想または保存中にエラーが発生しました: {e}")
-                with st.expander("詳細ログ"):
-                    st.code(traceback.format_exc())
+        except Exception as e:
+            st.session_state.pop("result_df", None)
+            st.error(f"予想または保存中にエラーが発生しました: {e}")
+            with st.expander("詳細ログ"):
+                st.code(traceback.format_exc())
 
     if "result_df" in st.session_state:
-        out = st.session_state["result_df"]  # 保存・CSV用の21列データ
-        view_out = st.session_state.get("result_view_df", out)  # 画面表示専用の補助列を含む
+        out = st.session_state["result_df"]
+        view_out = st.session_state.get("result_view_df", out)
         render_pace(st.session_state.get("pace", {"ok": False}))
 
-        st.subheader(f"④ AI予想結果（全{len(out)}頭・AI_Rank順）")
+        st.subheader(f"② AI予想結果（全{len(out)}頭・AI_Rank順）")
         if "複勝確率(3着以内)" in view_out.columns:
-            st.caption("勝率は単勝モデル、複勝確率は3着以内モデルの予測値です。複勝確率は画面表示のみで、保存データの21列形式は維持します。")
+            st.caption("勝率は単勝モデル、複勝確率は3着以内モデルの予測値です。")
         
         view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="pred_view_mode")
         
