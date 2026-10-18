@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-🏇 自分専用 競馬予想AI（オールインワン版・自動データクレンジング＆21列完全保証対応）
-- スプレッドシートや過去データに古い形式が混ざっていても自動で21列に整えるクレンジング機能を搭載
-- スマホ通信エラー対策、カード表示、CSV安全ダウンロード、ペース診断、モデル前処理を完全維持
+🏇 自分専用 競馬予想AI（オールインワン版・過去データタブ全件エクスポート対応）
+- 過去データ入力タブ（Tab 3）に、選択したタブの全データを丸ごとCSV出力する機能を追加
+- スマホ通信エラー対策、カード表示、CSV安全ダウンロード、自動クレンジング、ペース診断、モデル前処理を完全維持
 """
 import base64
 import io
@@ -122,12 +122,10 @@ def get_gspread_client():
 
 
 def ensure_21_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """どんなデータフレームが来ても必ず21列の固定フォーマットに整える自動クレンジング関数"""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     for col in COLUMNS_21:
         if col not in df.columns:
-            # 不足している重要な列にはデフォルト値を自動割り当て
             if col == "Distance":
                 df[col] = "1800"
             elif col == "Burden Weight":
@@ -490,7 +488,7 @@ with tab1:
             st.success("✨ 予想完了＆ `predictions` タブへの21列データ蓄積が完了しました！")
 
 
-# --- TAB 2: 過去データ参照（自動クレンジング適用） ---
+# --- TAB 2: 過去データ参照 ---
 with tab2:
     st.subheader("📊 過去の予想データ参照（predictions タブ）")
     if st.button("🔄 データを再読み込み"):
@@ -501,7 +499,6 @@ with tab2:
         df_hist_raw = conn.read(worksheet="predictions", ttl=0)
         if df_hist_raw is not None and not df_hist_raw.empty:
             df_hist_raw = df_hist_raw.dropna(how="all").dropna(axis=1, how="all")
-            # 💡 ここで自動クレンジングを通すことで古い形式の行・列混入を完全防止
             df_hist = ensure_21_columns(df_hist_raw)
             
             with st.expander("🔍 絞り込み・並び替え設定", expanded=True):
@@ -549,10 +546,10 @@ with tab2:
         st.warning(f"読み込みエラー: {e}")
 
 
-# --- TAB 3: 過去レース一括登録 ---
+# --- TAB 3: 過去レース一括登録 ＆ タブ全データエクスポート ---
 with tab3:
-    st.subheader("📥 過去レース結果データ 一括登録（21列完全フォーマット）")
-    st.caption("スプレッドシートのレース用タブを選択して一括登録できます。（※血統タブは自動除外されます）")
+    st.subheader("📥 過去レース結果データ 一括登録 ＆ エクスポート")
+    st.caption("スプレッドシートのレース用タブを選択し、データの登録または学習用CSVとしての全件エクスポートが行えます。")
 
     try:
         sh = get_gspread_client()
@@ -561,8 +558,31 @@ with tab3:
         ws_list = ["predictions"]
 
     def_idx = ws_list.index("predictions") if "predictions" in ws_list else 0
-    target_ws = st.selectbox("書き込み先タブを選択", ws_list, index=def_idx, key="races_ws")
+    target_ws = st.selectbox("対象タブを選択", ws_list, index=def_idx, key="races_ws")
 
+    # 💡【新規追加】選択したタブの全データをスプレッドシートから読み込んでCSV出力する機能
+    with st.expander(f"📥 「{target_ws}」タブの全データをCSV出力する（学習用）", expanded=False):
+        if st.button("🔄 対象タブのデータを取得", key="fetch_target_ws"):
+            st.cache_data.clear()
+        try:
+            conn_t = st.connection("gsheets", type=GSheetsConnection)
+            df_target_all = conn_t.read(worksheet=target_ws, ttl=0)
+            if df_target_all is not None and not df_target_all.empty:
+                df_target_all = df_target_all.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+                df_target_clean = ensure_21_columns(df_target_all)
+                st.info(f"「{target_ws}」タブから全 **{len(df_target_clean)} 件** のデータを読み込みました。")
+                
+                filename_target = f"{target_ws}_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv"
+                link_html_target = create_safe_download_link(df_target_clean, filename_target, f"📥 {target_ws} をCSV保存（スマホ対応）")
+                st.markdown(link_html_target, unsafe_allow_html=True)
+                st.dataframe(df_target_clean, use_container_width=True, height=200)
+            else:
+                st.info(f"「{target_ws}」タブにデータがありません。")
+        except Exception as e:
+            st.warning(f"読み込みエラー: {e}")
+
+    st.markdown("---")
+    st.subheader("📝 過去レースデータのテキスト一括登録")
     raw_races = st.text_area(
         "過去レースデータの貼り付け（21列 TSV / CSV）",
         height=220,
