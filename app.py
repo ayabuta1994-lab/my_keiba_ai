@@ -41,6 +41,97 @@ NUM_DEFAULTS = {
 STR_COLS = ["Horse Name", "Sex", "Jockey", "Trainer", "Venue", "Track Condition", "Weather"]
 COLUMNS_HORSES = ["Horse Name", "Sire", "Dam's Sire"]
 
+RACE_MANAGEMENT_SHEET = "race_management"
+RACE_MANAGEMENT_COLUMNS = ["Race ID", "Race Day", "Venue", "Race Name", "Distance", "Status", "Horse Count", "Registered At"]
+
+
+def _race_id(race_day, venue, race_name, distance=""):
+    """Stable ID kept outside the 21-column training dataset."""
+    parts = [str(race_day).strip(), str(venue).strip(), str(race_name).strip(), str(distance).strip()]
+    slug = "_".join(re.sub(r"[^\w一-龯ぁ-んァ-ン]+", "", x)[:24] for x in parts)
+    return slug or f"race_{datetime.now(JST).strftime('%Y%m%d%H%M%S')}"
+
+
+def _ensure_race_management_sheet(spreadsheet):
+    try:
+        ws = spreadsheet.worksheet(RACE_MANAGEMENT_SHEET)
+    except Exception:
+        ws = spreadsheet.add_worksheet(title=RACE_MANAGEMENT_SHEET, rows=1000, cols=len(RACE_MANAGEMENT_COLUMNS))
+        ws.append_row(RACE_MANAGEMENT_COLUMNS, value_input_option="USER_ENTERED")
+        return ws
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(RACE_MANAGEMENT_COLUMNS, value_input_option="USER_ENTERED")
+    elif [str(v).strip() for v in values[0][:len(RACE_MANAGEMENT_COLUMNS)]] != RACE_MANAGEMENT_COLUMNS:
+        raise ValueError(f"「{RACE_MANAGEMENT_SHEET}」タブのヘッダーが想定と異なります。既存データを保護するため自動変更しません。")
+    return ws
+
+
+def _register_race(spreadsheet, df):
+    """Register race metadata without adding Race ID to COLUMNS_21."""
+    if df is None or df.empty:
+        return ""
+    first = df.iloc[0]
+    race_day = str(first.get("Race Day", "")).strip()
+    venue = str(first.get("Venue", "")).strip()
+    race_name = str(first.get("Race Name", "")).strip()
+    distance = str(first.get("Distance", "")).strip()
+    if not race_day or not venue or not race_name:
+        return ""
+    rid = _race_id(race_day, venue, race_name, distance)
+    ws = _ensure_race_management_sheet(spreadsheet)
+    values = ws.get_all_values()
+    headers = values[0] if values else RACE_MANAGEMENT_COLUMNS
+    existing = values[1:] if len(values) > 1 else []
+    for row in existing:
+        row = row + [""] * (len(headers) - len(row))
+        if row[0] == rid:
+            return rid
+    ws.append_row([rid, race_day, venue, race_name, distance, "予想登録済み", str(len(df)), datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")], value_input_option="USER_ENTERED")
+    return rid
+
+
+def _load_race_management(spreadsheet):
+    ws = _ensure_race_management_sheet(spreadsheet)
+    values = ws.get_all_values()
+    # One-time/backfill behavior: make older races already stored in predictions selectable too.
+    try:
+        pred_ws = spreadsheet.worksheet("predictions")
+        pred_df = _read_worksheet_dataframe(pred_ws)
+        if not pred_df.empty and all(c in pred_df.columns for c in ("Race Day", "Venue", "Race Name", "Distance", "Horse Name")):
+            clean = ensure_21_columns(pred_df)
+            clean = clean[(clean["Race Day"].str.strip() != "") & (clean["Venue"].str.strip() != "") & (clean["Race Name"].str.strip() != "")]
+            known_ids = {str(r[0]).strip() for r in values[1:] if r and str(r[0]).strip()}
+            seen = set()
+            for _, race_row in clean.iterrows():
+                rid = _race_id(race_row["Race Day"], race_row["Venue"], race_row["Race Name"], race_row["Distance"])
+                if rid in known_ids or rid in seen:
+                    continue
+                same_race = clean[(clean["Race Day"] == race_row["Race Day"]) & (clean["Venue"] == race_row["Venue"]) & (clean["Race Name"] == race_row["Race Name"]) & (clean["Distance"] == race_row["Distance"])]
+                placings = same_race["Placing"].astype(str).str.strip()
+                status = "結果登録済み" if placings.ne("").any() else "予想登録済み"
+                ws.append_row([rid, race_row["Race Day"], race_row["Venue"], race_row["Race Name"], race_row["Distance"], status, str(len(same_race)), datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")], value_input_option="USER_ENTERED")
+                known_ids.add(rid)
+                seen.add(rid)
+            values = ws.get_all_values()
+    except Exception:
+        # Keep the result screen usable for manually registered rows even if old predictions cannot be read.
+        pass
+    if len(values) < 2:
+        return ws, pd.DataFrame(columns=RACE_MANAGEMENT_COLUMNS)
+    headers = values[0]
+    rows = [r + [""] * (len(headers) - len(r)) for r in values[1:] if any(str(x).strip() for x in r)]
+    df = pd.DataFrame(rows, columns=headers)
+    for c in RACE_MANAGEMENT_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    return ws, df[RACE_MANAGEMENT_COLUMNS].fillna("").astype(str)
+
+
+def _race_display_label(row):
+    return f"{row.get('Race Day', '')}｜{row.get('Venue', '')}｜{row.get('Race Name', '')}（{row.get('Distance', '')}m）"
+
+
 VENUES = ["札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉", "その他"]
 TRACKS = ["良", "稍重", "重", "不良"]
 WEATHERS = ["晴", "曇", "小雨", "雨", "雪"]
@@ -111,7 +202,7 @@ def _read_worksheet_dataframe(ws):
 def _load_spreadsheet_history(spreadsheet):
     frames = []
     for ws in spreadsheet.worksheets():
-        if ws.title == "horses_master":
+        if ws.title in ("horses_master", RACE_MANAGEMENT_SHEET):
             continue
         try:
             part = _read_worksheet_dataframe(ws)
@@ -541,7 +632,7 @@ with tab1:
 
     try:
         sh = get_gspread_client()
-        ws_list = [ws.title for ws in sh.worksheets() if ws.title != "horses_master"]
+        ws_list = [ws.title for ws in sh.worksheets() if ws.title not in ("horses_master", RACE_MANAGEMENT_SHEET)]
     except Exception:
         ws_list = ["predictions"]
 
@@ -604,6 +695,8 @@ with tab1:
 
                 ws = sh.worksheet("predictions")
                 ws.append_rows(out_21.values.tolist(), value_input_option="USER_ENTERED")
+                registered_race_id = _register_race(sh, out_21)
+                st.session_state["registered_race_id"] = registered_race_id
                 st.session_state["saved"] = True
 
         except Exception as e:
@@ -630,6 +723,9 @@ with tab1:
 
         if st.session_state.get("saved"):
             st.success("✨ 予想完了＆ `predictions` タブへの21列データ蓄積が完了しました！")
+            rid = st.session_state.get("registered_race_id", "")
+            if rid:
+                st.caption(f"結果入力用レースID（21列の外で管理）: `{rid}`")
 
 
 # --- TAB 2: 過去データ参照 ---
@@ -697,7 +793,7 @@ with tab3:
 
     try:
         sh = get_gspread_client()
-        ws_list = [ws.title for ws in sh.worksheets() if ws.title != "horses_master"]
+        ws_list = [ws.title for ws in sh.worksheets() if ws.title not in ("horses_master", RACE_MANAGEMENT_SHEET)]
     except Exception:
         ws_list = ["predictions"]
 
@@ -748,6 +844,89 @@ with tab3:
                     st.success(f"🎉 正常に {len(df_r)} 件のデータが追加されました！")
         except Exception as e:
             st.error(f"データの解析または書き込みに失敗しました: {e}")
+
+
+    st.markdown("---")
+    st.subheader("🏁 レースを選択して着順を登録")
+    st.caption("レースIDは管理タブで保持し、学習用21列には追加しません。下の入力は「Horse Number / Horse Name / Placing」の3列です。")
+    try:
+        sh_results = get_gspread_client()
+        registry_ws, registry_df = _load_race_management(sh_results)
+        if registry_df.empty:
+            st.info("まだレース管理データがありません。先に「出走表」タブのデータでAI予想を実行してください。")
+        else:
+            labels = [_race_display_label(row) for _, row in registry_df.iterrows()]
+            label_to_index = {label: i for i, label in enumerate(labels)}
+            chosen_label = st.selectbox("結果を登録するレース", labels, key="result_race_select")
+            chosen = registry_df.iloc[label_to_index[chosen_label]]
+            st.caption(f"管理用レースID: `{chosen['Race ID']}`　／　状態: {chosen['Status'] or '未登録'}")
+            result_text = st.text_area(
+                "着順データ（TSV / CSV）",
+                height=180,
+                key="race_result_text",
+                placeholder="Horse Number\tHorse Name\tPlacing\n1\tサンプルホースA\t1\n2\tサンプルホースB\t2"
+            )
+            if result_text.strip():
+                sep = "\t" if "\t" in result_text.splitlines()[0] else ","
+                result_df = pd.read_csv(StringIO(result_text.strip().lstrip("\ufeff")), sep=sep, dtype=str, keep_default_na=False, engine="python")
+                result_df.columns = [str(c).strip() for c in result_df.columns]
+                # Accept English headers or common Japanese equivalents.
+                aliases = {"馬番": "Horse Number", "馬名": "Horse Name", "着順": "Placing", "順位": "Placing"}
+                result_df = result_df.rename(columns={c: aliases.get(c, c) for c in result_df.columns})
+                required = ["Horse Number", "Horse Name", "Placing"]
+                if not all(c in result_df.columns for c in required):
+                    st.error("ヘッダーは Horse Number / Horse Name / Placing（または 馬番 / 馬名 / 着順）の3列にしてください。")
+                else:
+                    result_df = result_df[required].fillna("").astype(str)
+                    st.dataframe(result_df, use_container_width=True)
+                    if st.button("選択したレースの着順を predictions に反映", type="primary", key="apply_race_results"):
+                        pred_ws = sh_results.worksheet("predictions")
+                        all_values = pred_ws.get_all_values()
+                        if not all_values:
+                            st.error("predictions タブにデータがありません。")
+                        else:
+                            pred_headers = [str(x).strip() for x in all_values[0]]
+                            if not all(c in pred_headers for c in COLUMNS_21):
+                                st.error("predictions タブのヘッダーが21列仕様と一致しません。書き込みを中止しました。")
+                            else:
+                                idx = {c: pred_headers.index(c) for c in COLUMNS_21}
+                                updates = []
+                                matched = 0
+                                for _, rr in result_df.iterrows():
+                                    if not rr["Horse Number"].strip() or not rr["Horse Name"].strip() or not rr["Placing"].strip():
+                                        continue
+                                    for sheet_row_num, pred_row in enumerate(all_values[1:], start=2):
+                                        pred_row = pred_row + [""] * max(0, len(pred_headers) - len(pred_row))
+                                        same_race = (
+                                            str(pred_row[idx["Race Day"]]).strip() == str(chosen["Race Day"]).strip()
+                                            and str(pred_row[idx["Venue"]]).strip() == str(chosen["Venue"]).strip()
+                                            and str(pred_row[idx["Race Name"]]).strip() == str(chosen["Race Name"]).strip()
+                                        )
+                                        same_horse = (
+                                            str(pred_row[idx["Horse Number"]]).strip() == rr["Horse Number"].strip()
+                                            and _norm_horse(pred_row[idx["Horse Name"]]) == _norm_horse(rr["Horse Name"])
+                                        )
+                                        if same_race and same_horse:
+                                            col_letter = gspread.utils.rowcol_to_a1(1, idx["Placing"] + 1).rstrip("1")
+                                            updates.append({"range": f"{col_letter}{sheet_row_num}", "values": [[rr["Placing"].strip()]]})
+                                            matched += 1
+                                if not updates:
+                                    st.error("一致する予測行が見つかりませんでした。開催日・競馬場・レース名・馬番・馬名を確認してください。")
+                                else:
+                                    pred_ws.batch_update(updates, value_input_option="USER_ENTERED")
+                                    reg_values = registry_ws.get_all_values()
+                                    reg_headers = reg_values[0]
+                                    rid_col = reg_headers.index("Race ID")
+                                    status_col = reg_headers.index("Status")
+                                    for reg_row_num, reg_row in enumerate(reg_values[1:], start=2):
+                                        reg_row = reg_row + [""] * max(0, len(reg_headers) - len(reg_row))
+                                        if reg_row[rid_col] == chosen["Race ID"]:
+                                            status_letter = gspread.utils.rowcol_to_a1(1, status_col + 1).rstrip("1")
+                                            registry_ws.update_acell(f"{status_letter}{reg_row_num}", "結果登録済み")
+                                            break
+                                    st.success(f"着順を反映しました。更新対象は {matched} 行です。予測履歴の行は追加していません。")
+    except Exception as exc:
+        st.warning(f"レース結果入力画面の読み込みエラー: {exc}")
 
 
 # --- TAB 4: 血統データ登録 ＆ CSVダウンロード ---
