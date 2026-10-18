@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-🏇 自分専用 競馬予想AI（v5）× 展開・血統
+🏇 自分専用 競馬予想AI（v5）× 展開・血統（母父対応版）
 
 必要ファイル（GitHubリポジトリ直下）:
   - app.py / requirements.txt / model.pkl
@@ -41,15 +41,15 @@ JST = timezone(timedelta(hours=9))
 
 STD_COLS = [
     "Bracket", "Horse Number", "Horse Name", "Sex", "Horse Age",
-    "Burden Weight", "Jockey", "Trainer", "Sire", "Tactics",
+    "Burden Weight", "Jockey", "Trainer", "Sire", "Dam's Sire", "Tactics",
     "Total Prize", "Last Placing", "Last Time",
 ]
-NUM_DEFAULTS = {  # 数値列: 欠損時の補完方法（Tactics は別処理）
+NUM_DEFAULTS = {  # 数値列: 欠損時の補完方法
     "Bracket": 0, "Horse Number": 0, "Horse Age": 4, "Burden Weight": 55,
     "Total Prize": 0, "Last Placing": "median:9", "Last Time": "mean:90",
     "Distance": 0,
 }
-STR_COLS = ["Horse Name", "Sex", "Jockey", "Trainer", "Sire",
+STR_COLS = ["Horse Name", "Sex", "Jockey", "Trainer", "Sire", "Dam's Sire",
             "Venue", "Surface", "Track Condition", "Weather"]
 TACTICS_LABEL = {1: "逃げ", 2: "先行", 3: "差し", 4: "追込"}
 
@@ -64,9 +64,6 @@ def norm(s) -> str:
     return re.sub(r"[\s_\-]", "", str(s)).lower()
 
 
-# ------------------------------------------------------------------
-# モデル読み込み
-# ------------------------------------------------------------------
 @st.cache_resource(show_spinner="AIの頭脳を読み込み中…")
 def load_model():
     with open(MODEL_PATH, "rb") as f:
@@ -114,30 +111,9 @@ def get_feature_names(model, meta):
                 return list(v)
             except TypeError:
                 pass
-    booster = getattr(model, "booster_", None)
-    if booster is not None:
-        try:
-            return list(booster.feature_name())
-        except Exception:
-            pass
-    if hasattr(model, "get_booster"):
-        try:
-            names = model.get_booster().feature_names
-            if names:
-                return list(names)
-        except Exception:
-            pass
-    if hasattr(model, "feature_name"):
-        try:
-            return list(model.feature_name())
-        except Exception:
-            pass
     return None
 
 
-# ------------------------------------------------------------------
-# 入力データの解析・補正
-# ------------------------------------------------------------------
 def parse_csv(text: str) -> pd.DataFrame:
     text = text.strip()
     text = text.replace("```csv", "").replace("```", "").replace("\u3000", " ").strip()
@@ -155,7 +131,7 @@ def parse_csv(text: str) -> pd.DataFrame:
     if len(ren) < 8:  # ヘッダー無しとみなす
         df = pd.read_csv(StringIO(text), header=None, **read_kw)
         if df.shape[1] < len(STD_COLS):
-            raise ValueError("列数が足りません。13列（Bracket〜Last Time）のCSVを貼り付けてください。")
+            raise ValueError("列数が足りません。14列（Bracket〜Last Time）のCSVを貼り付けてください。")
         df = df.iloc[:, : len(STD_COLS)]
         df.columns = STD_COLS
     else:
@@ -189,7 +165,6 @@ def parse_time(v):
 
 
 def parse_tactics(v):
-    """脚質を 1=逃げ 2=先行 3=差し 4=追込 に正規化（数値でも日本語でもOK）。不明は NaN。"""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return np.nan
     s = str(v).strip()
@@ -229,7 +204,6 @@ def preprocess(df: pd.DataFrame, venue, surface, distance, track, weather) -> pd
             fill = rule
         df[c] = df[c].fillna(fill).astype(float)
 
-    # 脚質: 表示用ラベルと、モデル入力用の数値（未知は中央値で補完）
     code = df["Tactics"].map(parse_tactics)
     df["TacticsCode"] = code
     df["脚質ラベル"] = code.map(lambda x: TACTICS_LABEL.get(int(x), "不明") if pd.notna(x) else "不明")
@@ -240,15 +214,11 @@ def preprocess(df: pd.DataFrame, venue, surface, distance, track, weather) -> pd
         if c in df.columns:
             df[c] = df[c].fillna("不明").astype(str).str.strip()
 
-    # 馬番が取れなかった場合は行順で補完
     if (df["Horse Number"] == 0).all():
         df["Horse Number"] = np.arange(1, len(df) + 1, dtype=float)
     return df
 
 
-# ------------------------------------------------------------------
-# 展開予想・ペース診断
-# ------------------------------------------------------------------
 def diagnose_pace(df: pd.DataFrame) -> dict:
     code = df["TacticsCode"].dropna()
     known = len(code)
@@ -262,7 +232,6 @@ def diagnose_pace(df: pd.DataFrame) -> dict:
     n_oikomi = int((code == 4).sum())
     front_ratio = (n_nige + n_senko) / known
 
-    # 前方比率と逃げ馬の頭数からハイペース確率を算出（ロジスティック）
     z = 10.0 * (front_ratio - 0.42) + 0.9 * (n_nige - 1.5)
     high_prob = float(np.clip(1.0 / (1.0 + np.exp(-z)), 0.01, 0.99)) * 100
 
@@ -292,45 +261,10 @@ def render_pace(p: dict, out: pd.DataFrame):
     m2.metric("ハイペース確率", f"{p['high_prob']:.1f}%")
     m3.metric("逃げ・先行の割合", f"{p['front_ratio']:.1f}%")
 
-    breakdown = (f"逃げ{p['n_nige']}頭 / 先行{p['n_senko']}頭 / "
-                 f"差し{p['n_sashi']}頭 / 追込{p['n_oikomi']}頭")
-    if p["known"] < p["total"]:
-        breakdown += f"（脚質不明{p['total'] - p['known']}頭は集計外）"
 
-    if p["pace"] == "ハイペース":
-        st.warning(f"🔥 **ハイペース想定**（ハイペース確率 {p['high_prob']:.1f}%）\n\n"
-                   "逃げ・先行馬が多く、前が競り合って流れが速くなりそうです。"
-                   "**差し馬が有利になりそう**で、前に行く馬は最後に脚が鈍るリスクがあります。\n\n"
-                   f"脚質内訳: {breakdown}")
-        favored, tag = ["差し", "追込"], "差し・追込"
-    elif p["pace"] == "スローペース":
-        st.info(f"🐢 **スローペース想定**（ハイペース確率 {p['high_prob']:.1f}%）\n\n"
-                "前に行きたい馬が少なく、流れが落ち着きそうです。"
-                "**前残りの展開になりそう**で、逃げ・先行馬が粘り込みやすい一方、"
-                "後方の馬は展開面で不利になりがちです。\n\n"
-                f"脚質内訳: {breakdown}")
-        favored, tag = ["逃げ", "先行"], "逃げ・先行"
-    else:
-        st.info(f"⚖️ **ミドルペース想定**（ハイペース確率 {p['high_prob']:.1f}%）\n\n"
-                "極端な前傾・後傾にはなりにくく、脚質より馬の能力が結果に出やすい展開です。\n\n"
-                f"脚質内訳: {breakdown}")
-        favored, tag = None, None
-
-    if favored:
-        picks = out[out["想定脚質"].isin(favored)].head(3)
-        if len(picks):
-            names = "、".join(f"{int(r['馬番'])}番 {r['馬名']}（{r['AI予想確率(%)']:.1f}%）"
-                              for _, r in picks.iterrows())
-            st.caption(f"📌 展開が向きそうな{tag}で確率上位: {names}")
-    st.caption("※ペース診断は脚質の構成から算出した目安です（モデル予測とは別ロジック）。")
-
-
-# ------------------------------------------------------------------
-# 特徴量の組み立て・エンコード（未知カテゴリ対応）
-# ------------------------------------------------------------------
 DEFAULT_FEATURES = [
     "Venue", "Surface", "Distance", "Track Condition", "Weather", "Bracket", "Horse Number",
-    "Sex", "Horse Age", "Burden Weight", "Jockey", "Trainer", "Sire", "Tactics",
+    "Sex", "Horse Age", "Burden Weight", "Jockey", "Trainer", "Sire", "Dam's Sire", "Tactics",
     "Total Prize", "Last Placing", "Last Time",
 ]
 
@@ -354,26 +288,15 @@ def apply_encoder(series, enc):
         mapping = enc
     elif hasattr(enc, "classes_"):
         mapping = {v: i for i, v in enumerate(enc.classes_)}
-    elif hasattr(enc, "categories_") and len(enc.categories_) == 1:
-        mapping = {v: i for i, v in enumerate(enc.categories_[0])}
     else:
         return None
-    return series.map(mapping).fillna(-1).astype(float)  # 未知 → -1
+    return series.map(mapping).fillna(-1).astype(float)
 
 
 def encode_X(X, model, meta):
     warns = []
-    cat_feats = [c for c in X.columns
-                 if X[c].dtype == object or str(X[c].dtype).startswith("string")]
-
-    if hasattr(model, "steps"):  # sklearn Pipeline: 前処理を内包している想定
-        return X, warns
-
-    booster = getattr(model, "booster_", None)
-    pc = getattr(booster, "pandas_categorical", None) if booster is not None else None
-    if pc and len(pc) == len(cat_feats):  # LightGBM の category 型
-        for c, cats in zip(cat_feats, pc):
-            X[c] = pd.Categorical(X[c], categories=cats)  # 未知カテゴリは NaN
+    cat_feats = [c for c in X.columns if X[c].dtype == object or str(X[c].dtype).startswith("string")]
+    if hasattr(model, "steps"):
         return X, warns
 
     for c in cat_feats:
@@ -391,8 +314,6 @@ def predict_top3(model, X) -> np.ndarray:
         p = np.asarray(model.predict_proba(X))
         if p.ndim == 2:
             classes = getattr(model, "classes_", None)
-            if classes is None and hasattr(model, "steps"):
-                classes = getattr(model.steps[-1][1], "classes_", None)
             idx = p.shape[1] - 1
             if classes is not None:
                 cl = list(classes)
@@ -403,9 +324,6 @@ def predict_top3(model, X) -> np.ndarray:
     return np.clip(np.asarray(model.predict(X), dtype=float), 0, 1)
 
 
-# ------------------------------------------------------------------
-# Googleスプレッドシートへ追記
-# ------------------------------------------------------------------
 def append_to_sheet(new_rows: pd.DataFrame):
     conn = st.connection("gsheets", type=GSheetsConnection)
     try:
@@ -417,9 +335,6 @@ def append_to_sheet(new_rows: pd.DataFrame):
     conn.update(worksheet="predictions", data=combined)
 
 
-# ------------------------------------------------------------------
-# UI
-# ------------------------------------------------------------------
 st.title("🏇 自分専用 競馬予想AI（v5）× 展開・血統")
 
 try:
@@ -441,16 +356,15 @@ race_name = st.text_input("レース名（任意・記録用）", placeholder="�
 
 st.subheader("② 出馬表を貼り付け")
 st.caption("列順: Bracket, Horse Number, Horse Name, Sex, Horse Age, Burden Weight, "
-           "Jockey, Trainer, Sire, Tactics(1=逃げ 2=先行 3=差し 4=追込), "
-           "Total Prize, Last Placing, Last Time")
+           "Jockey, Trainer, Sire, **Dam's Sire**, Tactics, Total Prize, Last Placing, Last Time")
 csv_text = st.text_area(
     "出馬表CSV",
     height=320,
     label_visibility="collapsed",
     placeholder=(
         "Bracket,Horse Number,Horse Name,Sex,Horse Age,Burden Weight,Jockey,Trainer,"
-        "Sire,Tactics,Total Prize,Last Placing,Last Time\n"
-        "1,1,サンプルホース,牡,4,58,ルメール,友道,ドゥラメンテ,2,12000,2,1:34.5"
+        "Sire,Dam's Sire,Tactics,Total Prize,Last Placing,Last Time\n"
+        "1,1,サンプルホース,牡,4,58,ルメール,友道,ドゥラメンテ,サンデーサイレンス,2,12000,2,1:34.5"
     ),
 )
 
@@ -465,7 +379,6 @@ if run:
             if raw.empty:
                 raise ValueError("出走馬が1頭も読み取れませんでした。")
             df = preprocess(raw, venue, surface, distance, track, weather)
-
             pace = diagnose_pace(df)
 
             feats = get_feature_names(model, meta) or DEFAULT_FEATURES
@@ -477,7 +390,8 @@ if run:
             out = pd.DataFrame({
                 "馬番": df["Horse Number"].astype(int),
                 "馬名": df["Horse Name"],
-                "種牡馬": df["Sire"],
+                "父": df["Sire"],
+                "母父": df["Dam's Sire"],
                 "想定脚質": df["脚質ラベル"],
                 "AI予想確率(%)": np.round(np.asarray(proba, dtype=float) * 100, 1),
             })
@@ -500,12 +414,8 @@ if run:
             log.insert(8, "ハイペース確率(%)", pace.get("high_prob", ""))
             log.insert(9, "逃げ先行割合(%)", pace.get("front_ratio", ""))
 
-            try:
-                append_to_sheet(log)
-                st.session_state["saved"] = True
-            except Exception as e:
-                st.session_state["saved"] = False
-                st.session_state["save_err"] = str(e)
+            append_to_sheet(log)
+            st.session_state["saved"] = True
         except Exception as e:
             st.session_state.pop("result", None)
             st.error(f"予想中にエラーが発生しました: {e}")
@@ -515,8 +425,6 @@ if run:
 if "result" in st.session_state:
     out = st.session_state["result"]
     missing, hashed = st.session_state.get("notes", ([], []))
-
-    # 全馬ランキングの手前に展開予想を表示
     render_pace(st.session_state.get("pace", {"ok": False}), out)
 
     st.subheader(f"④ AI予想結果（全{len(out)}頭・3着以内確率順）")
@@ -524,28 +432,18 @@ if "result" in st.session_state:
         out,
         hide_index=True,
         use_container_width=True,
-        height=int(35 * (len(out) + 1) + 3),  # 全頭が省略なく表示される高さ
+        height=int(35 * (len(out) + 1) + 3),
         column_config={
             "順位": st.column_config.NumberColumn("順位", width="small"),
             "馬番": st.column_config.NumberColumn("馬番", width="small"),
             "馬名": st.column_config.TextColumn("馬名"),
-            "種牡馬": st.column_config.TextColumn("種牡馬"),
+            "父": st.column_config.TextColumn("父"),
+            "母父": st.column_config.TextColumn("母父"),
             "想定脚質": st.column_config.TextColumn("想定脚質", width="small"),
             "AI予想確率(%)": st.column_config.ProgressColumn(
                 "AI予想確率(%)", format="%.1f%%", min_value=0, max_value=100
             ),
         },
     )
-
     if st.session_state.get("saved"):
         st.success("データ蓄積完了")
-    elif st.session_state.get("saved") is False:
-        st.warning("予想は完了しましたが、スプレッドシートへの保存に失敗しました。"
-                   "Secretsの設定と共有権限、シート名 'predictions' を確認してください。")
-        st.caption(st.session_state.get("save_err", ""))
-
-    if missing:
-        st.caption(f"⚠️ 入力に無い特徴量は0で補完: {', '.join(missing)}")
-    if hashed:
-        st.caption(f"⚠️ エンコーダ情報が無いためハッシュ変換した列: {', '.join(hashed)}"
-                   "（精度のため、学習時のエンコーダをmodel.pkl に同梱推奨）")
