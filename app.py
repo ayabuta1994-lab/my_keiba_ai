@@ -2,9 +2,8 @@
 """
 🐴 自分専用 競馬予想AI（オールインワン版・21列完全統一フォーマット対応）
 - 全処理（予想・ログ保存・一括登録・過去参照）を21列フォーマットで統一
-- 過去データ参照タブのソート・絞り込み機能を完全復元
-- モデル前処理（エンコーダ/欠損補完）、ペース診断、UI/UX配置を完全維持
-- 血統マスタ（horses_master）は馬名・父・母父のみで分離管理
+- Google Sheets送信時の NaN エラー（Out of range float values）対策を適用
+- 過去データ参照タブのソート・絞り込み機能、ペース診断、モデル前処理を完全維持
 """
 import io
 import pickle
@@ -139,7 +138,7 @@ def parse_input_table(text: str) -> pd.DataFrame:
     for col in COLUMNS_21:
         if col not in df.columns:
             df[col] = ""
-    return df[COLUMNS_21].copy()
+    return df[COLUMNS_21].fillna("").copy()
 
 
 def parse_tactics(v):
@@ -322,7 +321,6 @@ except Exception as e:
     st.error(f"モデルの読み込みに失敗しました: {e}")
     st.stop()
 
-# タブ順序：過去データ参照をAI予想のすぐ隣に配置
 tab1, tab2, tab3, tab4 = st.tabs([
     "🔮 AI予想の実行", 
     "📊 過去データ参照", 
@@ -392,8 +390,8 @@ with tab1:
                 # 順位順にソートして保持
                 df_sorted = df.sort_values("AI_Probability", ascending=False).reset_index(drop=True)
                 
-                # スプレッドシート保存用に不要な前処理一時列を除外
-                out_21 = df_sorted[COLUMNS_21].copy()
+                # スプレッドシート保存用に不要な前処理一時列を除外＆NaNを空文字に変換（JSONエラー対策）
+                out_21 = df_sorted[COLUMNS_21].copy().fillna("").astype(str)
 
                 st.session_state["result_df"] = out_21
                 st.session_state["pace"] = pace
@@ -455,7 +453,7 @@ with tab2:
             if filter_venue and "Venue" in df_filtered.columns:
                 df_filtered = df_filtered[df_filtered["Venue"].isin(filter_venue)]
 
-            # ソートの適用（数値としてソート可能な列は数値化して正しく並べ替え）
+            # ソートの適用
             if sort_col in df_filtered.columns:
                 try:
                     num_series = pd.to_numeric(df_filtered[sort_col], errors="coerce")
@@ -482,7 +480,6 @@ with tab3:
 
     try:
         sh = get_gspread_client()
-        # horses_master タブを除外して対象リストを作成
         ws_list = [ws.title for ws in sh.worksheets() if ws.title != "horses_master"]
     except Exception:
         ws_list = ["predictions"]
@@ -506,7 +503,9 @@ with tab3:
             if st.button(f"🚀 「{target_ws}」タブに21列データを一括書き込み", type="primary"):
                 with st.spinner("書き込み中..."):
                     worksheet = sh.worksheet(target_ws)
-                    worksheet.append_rows(df_r.values.tolist(), value_input_option="USER_ENTERED")
+                    # NaN / None を完全に空文字文字列化して送信（エラー対策）
+                    clean_rows = df_r.fillna("").astype(str).values.tolist()
+                    worksheet.append_rows(clean_rows, value_input_option="USER_ENTERED")
                     st.balloons()
                     st.success(f"🎉 正常に {len(df_r)} 件のデータが追加されました！")
         except Exception as e:
@@ -541,7 +540,9 @@ with tab4:
                 with st.spinner("書き込み中..."):
                     sh = get_gspread_client()
                     worksheet = sh.worksheet("horses_master")
-                    worksheet.append_rows(df_h.values.tolist(), value_input_option="USER_ENTERED")
+                    # NaN / None を完全に空文字文字列化して送信（エラー対策）
+                    clean_horse_rows = df_h.fillna("").astype(str).values.tolist()
+                    worksheet.append_rows(clean_horse_rows, value_input_option="USER_ENTERED")
                     st.balloons()
                     st.success(f"🎉 正常に {len(df_h)} 頭の血統データが追加されました！")
         except Exception as e:
