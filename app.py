@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-🏇 自分専用 競馬予想AI（オールインワン版・スマホ通信エラー対策＆カード表示軽量化）
-- スマホでの大量データ描画による WebSocket の RangeError（インデックス範囲外）を防止
-- 過去データの表示件数制限（最大50件）とインデックスの完全リセットを実装
-- 全機能（21列統一、CSV安全ダウンロード、ペース診断、モデル前処理）を完全維持
+🏇 自分専用 競馬予想AI（オールインワン版・自動データクレンジング＆21列完全保証対応）
+- スプレッドシートや過去データに古い形式が混ざっていても自動で21列に整えるクレンジング機能を搭載
+- スマホ通信エラー対策、カード表示、CSV安全ダウンロード、ペース診断、モデル前処理を完全維持
 """
 import base64
 import io
@@ -122,6 +121,28 @@ def get_gspread_client():
         return gc.open_by_key(spreadsheet_ref)
 
 
+def ensure_21_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """どんなデータフレームが来ても必ず21列の固定フォーマットに整える自動クレンジング関数"""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    for col in COLUMNS_21:
+        if col not in df.columns:
+            # 不足している重要な列にはデフォルト値を自動割り当て
+            if col == "Distance":
+                df[col] = "1800"
+            elif col == "Burden Weight":
+                df[col] = "55.0"
+            elif col == "Track_Type":
+                df[col] = "1"
+            elif col == "AI_Probability":
+                df[col] = "0.0"
+            elif col == "AI_Rank":
+                df[col] = "1"
+            else:
+                df[col] = ""
+    return df[COLUMNS_21].fillna("").astype(str).copy()
+
+
 def parse_input_table(text: str) -> pd.DataFrame:
     text = text.strip().replace("```csv", "").replace("```", "").replace("\u3000", " ").strip()
     if not text:
@@ -130,12 +151,7 @@ def parse_input_table(text: str) -> pd.DataFrame:
     sep = "\t" if "\t" in first else ","
     
     df = pd.read_csv(StringIO(text), sep=sep, dtype=str, skipinitialspace=True, on_bad_lines="skip")
-    df.columns = [str(c).strip() for c in df.columns]
-
-    for col in COLUMNS_21:
-        if col not in df.columns:
-            df[col] = ""
-    return df[COLUMNS_21].fillna("").copy()
+    return ensure_21_columns(df)
 
 
 def parse_tactics(v):
@@ -336,10 +352,9 @@ def render_cards_prediction(df: pd.DataFrame):
 
 
 def render_cards_history(df: pd.DataFrame):
-    # スマホのメモリ負荷を防ぐため、最大50件までに制限して描画
     df_render = df.reset_index(drop=True).head(50)
     if len(df) > 50:
-        st.info(f"💡 データが全 {len(df)} 件あるため、直近・上位の 50 件を表示しています（全データは下のテーブル表示またはCSVダウンロードで確認できます）。")
+        st.info(f"💡 データが全 {len(df)} 件あるため、直近・上位の 50 件を表示しています。")
 
     for _, row in df_render.iterrows():
         r_name = row.get("Race Name", "レース")
@@ -442,7 +457,7 @@ with tab1:
                 df["AI_Rank"] = rank_series.astype(str)
 
                 df_sorted = df.sort_values("AI_Probability", ascending=False).reset_index(drop=True)
-                out_21 = df_sorted[COLUMNS_21].copy().fillna("").astype(str)
+                out_21 = ensure_21_columns(df_sorted)
 
                 st.session_state["result_df"] = out_21
                 st.session_state["pace"] = pace
@@ -475,7 +490,7 @@ with tab1:
             st.success("✨ 予想完了＆ `predictions` タブへの21列データ蓄積が完了しました！")
 
 
-# --- TAB 2: 過去データ参照 ---
+# --- TAB 2: 過去データ参照（自動クレンジング適用） ---
 with tab2:
     st.subheader("📊 過去の予想データ参照（predictions タブ）")
     if st.button("🔄 データを再読み込み"):
@@ -483,9 +498,11 @@ with tab2:
 
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
-        df_hist = conn.read(worksheet="predictions", ttl=0)
-        if df_hist is not None and not df_hist.empty:
-            df_hist = df_hist.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+        df_hist_raw = conn.read(worksheet="predictions", ttl=0)
+        if df_hist_raw is not None and not df_hist_raw.empty:
+            df_hist_raw = df_hist_raw.dropna(how="all").dropna(axis=1, how="all")
+            # 💡 ここで自動クレンジングを通すことで古い形式の行・列混入を完全防止
+            df_hist = ensure_21_columns(df_hist_raw)
             
             with st.expander("🔍 絞り込み・並び替え設定", expanded=True):
                 fc1, fc2, fc3 = st.columns(3)
@@ -535,7 +552,7 @@ with tab2:
 # --- TAB 3: 過去レース一括登録 ---
 with tab3:
     st.subheader("📥 過去レース結果データ 一括登録（21列完全フォーマット）")
-    st.caption("スプレッドシートのレース用タブ（predictions や過去別タブ）を選択して一括登録できます。（※血統タブは自動除外されます）")
+    st.caption("スプレッドシートのレース用タブを選択して一括登録できます。（※血統タブは自動除外されます）")
 
     try:
         sh = get_gspread_client()
@@ -583,6 +600,11 @@ with tab4:
             df_horses_hist = conn_h.read(worksheet="horses_master", ttl=0)
             if df_horses_hist is not None and not df_horses_hist.empty:
                 df_horses_hist = df_horses_hist.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+                for c in COLUMNS_HORSES:
+                    if c not in df_horses_hist.columns:
+                        df_horses_hist[c] = ""
+                df_horses_hist = df_horses_hist[COLUMNS_HORSES].fillna("").astype(str)
+
                 st.info(f"全 **{len(df_horses_hist)} 頭** の血統データを読み込みました。")
                 
                 filename_horses = f"horses_master_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv"
@@ -611,7 +633,7 @@ with tab4:
             for col in COLUMNS_HORSES:
                 if col not in df_h.columns:
                     df_h[col] = ""
-            df_h = df_h[COLUMNS_HORSES].fillna("").reset_index(drop=True)
+            df_h = df_h[COLUMNS_HORSES].fillna("").reset_index(drop=True).astype(str)
 
             st.success(f"解析成功: **{len(df_h)} 頭** の血統データ（書き込み先: **horses_master**）")
             st.dataframe(df_h, use_container_width=True)
@@ -620,7 +642,7 @@ with tab4:
                 with st.spinner("書き込み中..."):
                     sh = get_gspread_client()
                     worksheet = sh.worksheet("horses_master")
-                    clean_horse_rows = df_h.fillna("").astype(str).values.tolist()
+                    clean_horse_rows = df_h.values.tolist()
                     worksheet.append_rows(clean_horse_rows, value_input_option="USER_ENTERED")
                     st.balloons()
                     st.success(f"🎉 正常に {len(df_h)} 頭の血統データが追加されました！")
