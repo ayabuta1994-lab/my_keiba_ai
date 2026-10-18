@@ -91,16 +91,47 @@ def _norm_horse(v):
     return re.sub(r"[\s\u200b-\u200f\u2060\ufeff]", "", str(v or ""))
 
 
-def _load_local_history():
-    """学習時に出力した21列CSVを推論時の過去戦績参照に使う。"""
-    p = Path(__file__).parent / "training_data_21cols.csv"
-    if not p.exists():
+def _read_worksheet_dataframe(ws):
+    """Googleスプレッドシートの1タブをヘッダー付きDataFrameとして読む。"""
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return pd.DataFrame()
+    headers = [str(v).strip() for v in values[0]]
+    if not any(headers):
+        return pd.DataFrame()
+    # 末尾の空ヘッダーを除き、行の長さをヘッダーに合わせる。
+    while headers and not headers[-1]:
+        headers.pop()
+    if not headers:
+        return pd.DataFrame()
+    rows = []
+    for row in values[1:]:
+        row = list(row[:len(headers)])
+        if len(row) < len(headers):
+            row.extend([""] * (len(headers) - len(row)))
+        rows.append(row)
+    return pd.DataFrame(rows, columns=headers)
+
+
+def _load_spreadsheet_history(spreadsheet):
+    """過去戦績はGoogle Sheets上のレースデータタブからのみ取得する。"""
+    frames = []
+    for ws in spreadsheet.worksheets():
+        if ws.title == "horses_master":
+            continue
+        try:
+            part = _read_worksheet_dataframe(ws)
+        except Exception as exc:
+            # 無関係な空タブ等はスキップするが、読み取り対象の戦績タブで失敗した場合は通知する。
+            raise RuntimeError(f"スプレッドシートの「{ws.title}」タブを読み込めません: {exc}") from exc
+        if part.empty or "Horse Name" not in part.columns:
+            continue
+        if not ("Race Day" in part.columns or "Placing" in part.columns):
+            continue
+        frames.append(ensure_21_columns(part))
+    if not frames:
         return pd.DataFrame(columns=COLUMNS_21)
-    try:
-        hist = pd.read_csv(p, dtype=str, low_memory=False)
-        return ensure_21_columns(hist)
-    except Exception:
-        return pd.DataFrame(columns=COLUMNS_21)
+    return pd.concat(frames, ignore_index=True)
 
 
 def _new_model_matrix(df, bundle):
@@ -108,15 +139,9 @@ def _new_model_matrix(df, bundle):
     numeric = set(bundle.get("numeric_features", []))
     categorical = set(bundle.get("categorical_features", []))
     encoders = bundle.get("encoders", {})
-    hist = _load_local_history()
-    # Google Sheets に蓄積済みの予想・結果も過去戦績に加える（読み取りに失敗しても予想自体は続行）。
-    try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        sheet_hist = conn.read(worksheet="predictions", ttl=0)
-        if sheet_hist is not None and not sheet_hist.empty:
-            hist = pd.concat([hist, ensure_21_columns(sheet_hist)], ignore_index=True)
-    except Exception:
-        pass
+    # 過去戦績・血統情報はGoogleスプレッドシートのみを参照する。
+    spreadsheet = get_gspread_client()
+    hist = _load_spreadsheet_history(spreadsheet)
     hist = ensure_21_columns(hist).drop_duplicates(
         subset=["Race Day", "Race Name", "Venue", "Horse Number", "Horse Name"], keep="last"
     )
@@ -125,25 +150,16 @@ def _new_model_matrix(df, bundle):
     hist["_last3f"] = to_number(hist["Last 3F"])
     hist["_tactics"] = hist["Tactics"].map(parse_tactics)
 
-    # 血統はローカルのMASTERを優先。MASTERが無い場合も未知カテゴリとして扱う。
-    pedigree = {}
-    hp = Path(__file__).parent / "horses_master_export_20261018_125756.csv"
-    if hp.exists():
-        try:
-            hdf = pd.read_csv(hp, dtype=str, low_memory=False).fillna("")
-            if "Horse Name" in hdf.columns:
-                for _, hr in hdf.iterrows():
-                    pedigree[_norm_horse(hr.get("Horse Name", ""))] = (hr.get("Sire", ""), hr.get("Dam's Sire", ""))
-        except Exception:
-            pass
+    # 血統マスタは Google Sheets の horses_master タブだけを参照する。
     try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        shorses = conn.read(worksheet="horses_master", ttl=0)
-        if shorses is not None and not shorses.empty and "Horse Name" in shorses.columns:
-            for _, hr in shorses.fillna("").iterrows():
-                pedigree[_norm_horse(hr.get("Horse Name", ""))] = (hr.get("Sire", ""), hr.get("Dam's Sire", ""))
-    except Exception:
-        pass
+        horses_ws = spreadsheet.worksheet("horses_master")
+    except Exception as exc:
+        raise RuntimeError("Googleスプレッドシートに「horses_master」タブがありません。血統マスタ用タブを作成してください。") from exc
+    shorses = _read_worksheet_dataframe(horses_ws)
+    pedigree = {}
+    if not shorses.empty and "Horse Name" in shorses.columns:
+        for _, hr in shorses.fillna("").iterrows():
+            pedigree[_norm_horse(hr.get("Horse Name", ""))] = (hr.get("Sire", ""), hr.get("Dam's Sire", ""))
 
     rows = []
     for _, r in df.iterrows():
