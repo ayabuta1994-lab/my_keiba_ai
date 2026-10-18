@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-🐴 自分専用 競馬予想AI（オールインワン版・21列完全統一フォーマット対応）
+🏇 自分専用 競馬予想AI（オールインワン版・スマホ表示最適化＆21列完全統一対応）
+- スマホ画面でも横スクロール不要で一目で見やすい「カード表示」UIに対応
 - 全処理（予想・ログ保存・一括登録・過去参照）を21列フォーマットで統一
-- Google Sheets送信時の NaN エラー（Out of range float values）対策を適用
-- 過去データ参照タブのソート・絞り込み機能、ペース診断、モデル前処理を完全維持
+- CSVダウンロード機能、NaNエラー対策、ソート・検索フィルター、ペース診断、モデル前処理を完全維持
 """
 import io
 import pickle
@@ -35,14 +35,11 @@ COLUMNS_21 = [
     "Tactics", "Last 3F", "AI_Probability", "AI_Rank", "Placing", "Track_Type"
 ]
 
-# 入力項目補完・前処理用デフォルト値
 NUM_DEFAULTS = {
     "Bracket": 0, "Horse Number": 0, "Horse Age": 4, "Burden Weight": 55,
     "Last 3F": "mean:36.5", "Distance": 1800,
 }
 STR_COLS = ["Horse Name", "Sex", "Jockey", "Trainer", "Venue", "Track Condition", "Weather"]
-
-# 血統マスタ（horses_master）専用の3列定義
 COLUMNS_HORSES = ["Horse Name", "Sire", "Dam's Sire"]
 
 VENUES = ["札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉", "その他"]
@@ -134,7 +131,6 @@ def parse_input_table(text: str) -> pd.DataFrame:
     df = pd.read_csv(StringIO(text), sep=sep, dtype=str, skipinitialspace=True, on_bad_lines="skip")
     df.columns = [str(c).strip() for c in df.columns]
 
-    # 不足列を空欄補完し、全21列の順序に固定
     for col in COLUMNS_21:
         if col not in df.columns:
             df[col] = ""
@@ -161,13 +157,10 @@ def to_number(series: pd.Series) -> pd.Series:
 
 def preprocess(df: pd.DataFrame, default_values: dict) -> pd.DataFrame:
     df = df.copy()
-
-    # ドロップダウン等の共通条件で空欄を補完
     for k, v in default_values.items():
         if k in df.columns:
             df[k] = df[k].replace("", str(v)).fillna(str(v))
 
-    # 数値項目の型変換と欠損補完
     for c in NUM_DEFAULTS:
         if c in df.columns:
             df[c] = to_number(df[c])
@@ -180,14 +173,12 @@ def preprocess(df: pd.DataFrame, default_values: dict) -> pd.DataFrame:
                 fill = rule
             df[c] = df[c].fillna(fill).astype(float)
 
-    # 脚質の解析と数値変換
     code = df["Tactics"].map(parse_tactics)
     df["TacticsCode"] = code
     df["脚質ラベル"] = code.map(lambda x: TACTICS_LABEL.get(int(x), "不明") if pd.notna(x) else "不明")
     med = code.median()
     df["Tactics"] = code.fillna(med if pd.notna(med) else 2.0).astype(float)
 
-    # 文字列項目のクレンジング
     for c in STR_COLS:
         if c in df.columns:
             df[c] = df[c].fillna("不明").astype(str).str.strip()
@@ -309,6 +300,64 @@ def get_feature_names_custom(model, meta):
     return None
 
 
+# --- 📱 スマホ表示用カードUIコンポーネント ---
+def render_cards_prediction(df: pd.DataFrame):
+    """予想結果（Tab1）をスマホで見やすいカード一覧として表示"""
+    for _, row in df.iterrows():
+        rank = row.get("AI_Rank", "-")
+        prob = row.get("AI_Probability", "-")
+        horse = row.get("Horse Name", "-")
+        h_num = row.get("Horse Number", "-")
+        bracket = row.get("Bracket", "-")
+        jockey = row.get("Jockey", "-")
+        trainer = row.get("Trainer", "-")
+        sex = row.get("Sex", "")
+        age = row.get("Horse Age", "")
+        weight = row.get("Burden Weight", "")
+        tactics = row.get("Tactics", "")
+        last3f = row.get("Last 3F", "")
+
+        # ランクに応じたアイコンバッジ
+        badge = "🥇" if str(rank) == "1" else ("🥈" if str(rank) == "2" else ("🥉" if str(rank) == "3" else "🏇"))
+
+        with st.container(border=True):
+            col_left, col_right = st.columns([2, 1])
+            with col_left:
+                st.markdown(f"### {badge} {h_num}番 **{horse}**")
+                st.caption(f"{bracket}枠 | {sex}{age} | 斤量: {weight}kg | {jockey} ({trainer})")
+                st.text(f"脚質: {tactics} | 上がり3F: {last3f}s")
+            with col_right:
+                st.metric("AI順位", f"{rank}位")
+                st.metric("勝率", f"{prob}%")
+
+
+def render_cards_history(df: pd.DataFrame):
+    """過去データ（Tab2）をスマホで見やすいカード一覧として表示"""
+    for _, row in df.iterrows():
+        r_name = row.get("Race Name", "レース")
+        r_day = row.get("Race Day", "")
+        venue = row.get("Venue", "")
+        dist = row.get("Distance", "")
+        horse = row.get("Horse Name", "")
+        h_num = row.get("Horse Number", "")
+        rank = row.get("AI_Rank", "-")
+        prob = row.get("AI_Probability", "-")
+        placing = row.get("Placing", "-")
+
+        badge = "🥇" if str(rank) == "1" else ("🥈" if str(rank) == "2" else ("🥉" if str(rank) == "3" else "🐴"))
+
+        with st.container(border=True):
+            st.markdown(f"**{r_day} {venue} {r_name} ({dist}m)**")
+            c1, c2, c3 = st.columns([2, 1, 1])
+            with c1:
+                st.markdown(f"{badge} **{h_num}番 {horse}**")
+                st.caption(f"騎手: {row.get('Jockey', '-')} / 斤量: {row.get('Burden Weight', '-')}kg")
+            with c2:
+                st.metric("AI予想", f"{rank}位", f"{prob}%")
+            with c3:
+                st.metric("実着順", f"{placing}着" if placing else "-")
+
+
 # --- アプリケーション本体 ---
 st.title("🐴 自分専用 競馬予想AI（オールインワン版）")
 
@@ -346,7 +395,7 @@ with tab1:
 
     st.subheader("② 出馬表（21列フォーマット）の貼り付け")
     st.caption("※21列の固定TSV/CSVテキストを貼り付けてください。共通条件は空欄部分に自動補完されます。")
-    csv_text = st.text_area("21列データテキスト", height=250, placeholder="\t".join(COLUMNS_21))
+    csv_text = st.text_area("21列データテキスト", height=200, placeholder="\t".join(COLUMNS_21))
 
     run = st.button("🔮 AI予想を実行する", type="primary", use_container_width=True)
 
@@ -369,11 +418,9 @@ with tab1:
                     "Track_Type": TRACK_TYPES.get(default_track_type, "1")
                 }
 
-                # 前処理と欠損値補完
                 df = preprocess(raw_df, defaults_map)
                 pace = diagnose_pace(df)
 
-                # モデル推論の実行
                 feats = get_feature_names_custom(model, meta) or [
                     "Bracket", "Horse Number", "Horse Age", "Burden Weight", "Tactics", "Distance", "Last 3F"
                 ]
@@ -382,21 +429,16 @@ with tab1:
                 proba = predict_top3(model, X)
                 proba_pct = np.round(np.asarray(proba, dtype=float) * 100, 1)
 
-                # 予測結果を21列に組み込み
                 df["AI_Probability"] = proba_pct.astype(str)
                 rank_series = pd.Series(proba_pct).rank(ascending=False, method="min").astype(int)
                 df["AI_Rank"] = rank_series.astype(str)
 
-                # 順位順にソートして保持
                 df_sorted = df.sort_values("AI_Probability", ascending=False).reset_index(drop=True)
-                
-                # スプレッドシート保存用に不要な前処理一時列を除外＆NaNを空文字に変換（JSONエラー対策）
                 out_21 = df_sorted[COLUMNS_21].copy().fillna("").astype(str)
 
                 st.session_state["result_df"] = out_21
                 st.session_state["pace"] = pace
 
-                # predictions タブへ21列データをそのまま自動書き込み
                 sh = get_gspread_client()
                 ws = sh.worksheet("predictions")
                 ws.append_rows(out_21.values.tolist(), value_input_option="USER_ENTERED")
@@ -413,17 +455,20 @@ with tab1:
         render_pace(st.session_state.get("pace", {"ok": False}))
 
         st.subheader(f"④ AI予想結果（全{len(out)}頭・AI_Rank順）")
-        st.dataframe(
-            out,
-            hide_index=True,
-            use_container_width=True,
-            height=int(35 * (len(out) + 1) + 3),
-        )
+        
+        # 📱 表示スタイルの切替（スマホ用カード表示 / 従来テーブル表示）
+        view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="pred_view_mode")
+        
+        if view_mode == "📱 スマホ用カード表示":
+            render_cards_prediction(out)
+        else:
+            st.dataframe(out, hide_index=True, use_container_width=True, height=int(35 * (len(out) + 1) + 3))
+
         if st.session_state.get("saved"):
             st.success("✨ 予想完了＆ `predictions` タブへの21列データ蓄積が完了しました！")
 
 
-# --- TAB 2: 過去データ参照（ソート・検索機能付き） ---
+# --- TAB 2: 過去データ参照（ソート・検索 ＆ スマホ表示対応） ---
 with tab2:
     st.subheader("📊 過去の予想データ参照（predictions タブ）")
     if st.button("🔄 データを再読み込み"):
@@ -435,7 +480,6 @@ with tab2:
         if df_hist is not None and not df_hist.empty:
             df_hist = df_hist.dropna(how="all").dropna(axis=1, how="all")
             
-            # --- ソート・フィルタリング機能 ---
             with st.expander("🔍 絞り込み・並び替え設定", expanded=True):
                 fc1, fc2, fc3 = st.columns(3)
                 with fc1:
@@ -446,14 +490,12 @@ with tab2:
                     sort_col = st.selectbox("並び替えの基準列", options=list(df_hist.columns), index=0)
                     ascending = st.radio("昇順/降順", options=["降順（新しい順/高ランク順）", "昇順"], index=0) == "昇順"
 
-            # フィルタの適用
             df_filtered = df_hist.copy()
             if filter_race_name and "Race Name" in df_filtered.columns:
                 df_filtered = df_filtered[df_filtered["Race Name"].astype(str).str.contains(filter_race_name, na=False)]
             if filter_venue and "Venue" in df_filtered.columns:
                 df_filtered = df_filtered[df_filtered["Venue"].isin(filter_venue)]
 
-            # ソートの適用
             if sort_col in df_filtered.columns:
                 try:
                     num_series = pd.to_numeric(df_filtered[sort_col], errors="coerce")
@@ -466,7 +508,23 @@ with tab2:
                     df_filtered = df_filtered.sort_values(sort_col, ascending=ascending)
 
             st.success(f"表示中: **{len(df_filtered)} / {len(df_hist)} 件** のデータ")
-            st.dataframe(df_filtered, use_container_width=True, height=500)
+
+            # CSVダウンロードボタン
+            csv_data = df_filtered.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="📥 表示中のデータをCSVとしてダウンロード",
+                data=csv_data,
+                file_name=f"predictions_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                type="primary"
+            )
+
+            # 📱 表示スタイルの切替
+            hist_view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="hist_view_mode")
+            if hist_view_mode == "📱 スマホ用カード表示":
+                render_cards_history(df_filtered)
+            else:
+                st.dataframe(df_filtered, use_container_width=True, height=500)
         else:
             st.info("predictions タブにデータがありません。")
     except Exception as e:
@@ -503,7 +561,6 @@ with tab3:
             if st.button(f"🚀 「{target_ws}」タブに21列データを一括書き込み", type="primary"):
                 with st.spinner("書き込み中..."):
                     worksheet = sh.worksheet(target_ws)
-                    # NaN / None を完全に空文字文字列化して送信（エラー対策）
                     clean_rows = df_r.fillna("").astype(str).values.tolist()
                     worksheet.append_rows(clean_rows, value_input_option="USER_ENTERED")
                     st.balloons()
@@ -512,11 +569,36 @@ with tab3:
             st.error(f"データの解析または書き込みに失敗しました: {e}")
 
 
-# --- TAB 4: 血統データ登録（馬名・父・母父のみ） ---
+# --- TAB 4: 血統データ登録 ＆ CSVダウンロード ---
 with tab4:
-    st.subheader("🧬 血統データ一括登録（horses_master 専用）")
-    st.caption("馬名・父・母父の3項目のみを `horses_master` タブへ一括登録します。")
+    st.subheader("🧬 血統データ管理（horses_master 専用）")
+    st.caption("血統データ（馬名・父・母父）の登録および学習用CSVダウンロードが行えます。")
 
+    with st.expander("📥 登録済みの血統データをCSVダウンロード", expanded=False):
+        if st.button("🔄 血統データを読み込む"):
+            st.cache_data.clear()
+        try:
+            conn_h = st.connection("gsheets", type=GSheetsConnection)
+            df_horses_hist = conn_h.read(worksheet="horses_master", ttl=0)
+            if df_horses_hist is not None and not df_horses_hist.empty:
+                df_horses_hist = df_horses_hist.dropna(how="all").dropna(axis=1, how="all")
+                st.info(f"全 **{len(df_horses_hist)} 頭** の血統データを読み込みました。")
+                
+                csv_horses = df_horses_hist.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    label="📥 horses_master をCSVとしてダウンロード",
+                    data=csv_horses,
+                    file_name=f"horses_master_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+                st.dataframe(df_horses_hist, use_container_width=True, height=250)
+            else:
+                st.info("horses_master タブにデータがありません。")
+        except Exception as e:
+            st.warning(f"血統データの読み込みエラー: {e}")
+
+    st.markdown("---")
+    st.subheader("🧬 血統データ一括登録")
     raw_horses = st.text_area(
         "血統データの貼り付け（TSV / CSV）",
         height=220,
@@ -540,7 +622,6 @@ with tab4:
                 with st.spinner("書き込み中..."):
                     sh = get_gspread_client()
                     worksheet = sh.worksheet("horses_master")
-                    # NaN / None を完全に空文字文字列化して送信（エラー対策）
                     clean_horse_rows = df_h.fillna("").astype(str).values.tolist()
                     worksheet.append_rows(clean_horse_rows, value_input_option="USER_ENTERED")
                     st.balloons()
