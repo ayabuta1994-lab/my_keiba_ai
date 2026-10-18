@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-🏇 自分専用 競馬予想AI（オールインワン版・スマホ表示最適化＆21列完全統一対応）
-- スマホ画面でも横スクロール不要で一目で見やすい「カード表示」UIに対応
-- 全処理（予想・ログ保存・一括登録・過去参照）を21列フォーマットで統一
-- CSVダウンロード機能、NaNエラー対策、ソート・検索フィルター、ペース診断、モデル前処理を完全維持
+🏇 自分専用 競馬予想AI（オールインワン版・スマホ通信エラー対策＆カード表示軽量化）
+- スマホでの大量データ描画による WebSocket の RangeError（インデックス範囲外）を防止
+- 過去データの表示件数制限（最大50件）とインデックスの完全リセットを実装
+- 全機能（21列統一、CSV安全ダウンロード、ペース診断、モデル前処理）を完全維持
 """
+import base64
 import io
 import pickle
 import re
@@ -300,10 +301,14 @@ def get_feature_names_custom(model, meta):
     return None
 
 
-# --- 📱 スマホ表示用カードUIコンポーネント ---
+def create_safe_download_link(df: pd.DataFrame, filename: str, label: str) -> str:
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    b64 = base64.b64encode(csv_bytes).decode()
+    return f'<a href="data:file/csv;base64,{b64}" download="{filename}" target="_blank" style="display: inline-block; padding: 0.5em 1em; color: white; background-color: #FF4B4B; border-radius: 8px; text-decoration: none; font-weight: bold; margin-bottom: 10px;">{label}</a>'
+
+
 def render_cards_prediction(df: pd.DataFrame):
-    """予想結果（Tab1）をスマホで見やすいカード一覧として表示"""
-    for _, row in df.iterrows():
+    for _, row in df.reset_index(drop=True).iterrows():
         rank = row.get("AI_Rank", "-")
         prob = row.get("AI_Probability", "-")
         horse = row.get("Horse Name", "-")
@@ -317,7 +322,6 @@ def render_cards_prediction(df: pd.DataFrame):
         tactics = row.get("Tactics", "")
         last3f = row.get("Last 3F", "")
 
-        # ランクに応じたアイコンバッジ
         badge = "🥇" if str(rank) == "1" else ("🥈" if str(rank) == "2" else ("🥉" if str(rank) == "3" else "🏇"))
 
         with st.container(border=True):
@@ -332,8 +336,12 @@ def render_cards_prediction(df: pd.DataFrame):
 
 
 def render_cards_history(df: pd.DataFrame):
-    """過去データ（Tab2）をスマホで見やすいカード一覧として表示"""
-    for _, row in df.iterrows():
+    # スマホのメモリ負荷を防ぐため、最大50件までに制限して描画
+    df_render = df.reset_index(drop=True).head(50)
+    if len(df) > 50:
+        st.info(f"💡 データが全 {len(df)} 件あるため、直近・上位の 50 件を表示しています（全データは下のテーブル表示またはCSVダウンロードで確認できます）。")
+
+    for _, row in df_render.iterrows():
         r_name = row.get("Race Name", "レース")
         r_day = row.get("Race Day", "")
         venue = row.get("Venue", "")
@@ -456,7 +464,6 @@ with tab1:
 
         st.subheader(f"④ AI予想結果（全{len(out)}頭・AI_Rank順）")
         
-        # 📱 表示スタイルの切替（スマホ用カード表示 / 従来テーブル表示）
         view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="pred_view_mode")
         
         if view_mode == "📱 スマホ用カード表示":
@@ -468,7 +475,7 @@ with tab1:
             st.success("✨ 予想完了＆ `predictions` タブへの21列データ蓄積が完了しました！")
 
 
-# --- TAB 2: 過去データ参照（ソート・検索 ＆ スマホ表示対応） ---
+# --- TAB 2: 過去データ参照 ---
 with tab2:
     st.subheader("📊 過去の予想データ参照（predictions タブ）")
     if st.button("🔄 データを再読み込み"):
@@ -478,7 +485,7 @@ with tab2:
         conn = st.connection("gsheets", type=GSheetsConnection)
         df_hist = conn.read(worksheet="predictions", ttl=0)
         if df_hist is not None and not df_hist.empty:
-            df_hist = df_hist.dropna(how="all").dropna(axis=1, how="all")
+            df_hist = df_hist.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
             
             with st.expander("🔍 絞り込み・並び替え設定", expanded=True):
                 fc1, fc2, fc3 = st.columns(3)
@@ -507,19 +514,13 @@ with tab2:
                 except Exception:
                     df_filtered = df_filtered.sort_values(sort_col, ascending=ascending)
 
+            df_filtered = df_filtered.reset_index(drop=True)
             st.success(f"表示中: **{len(df_filtered)} / {len(df_hist)} 件** のデータ")
 
-            # CSVダウンロードボタン
-            csv_data = df_filtered.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                label="📥 表示中のデータをCSVとしてダウンロード",
-                data=csv_data,
-                file_name=f"predictions_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                type="primary"
-            )
+            filename_pred = f"predictions_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv"
+            link_html_pred = create_safe_download_link(df_filtered, filename_pred, "📥 表示中のデータをCSV保存（スマホ対応）")
+            st.markdown(link_html_pred, unsafe_allow_html=True)
 
-            # 📱 表示スタイルの切替
             hist_view_mode = st.radio("表示スタイル切り替え", ["📱 スマホ用カード表示", "💻 従来テーブル表示"], horizontal=True, key="hist_view_mode")
             if hist_view_mode == "📱 スマホ用カード表示":
                 render_cards_history(df_filtered)
@@ -581,16 +582,13 @@ with tab4:
             conn_h = st.connection("gsheets", type=GSheetsConnection)
             df_horses_hist = conn_h.read(worksheet="horses_master", ttl=0)
             if df_horses_hist is not None and not df_horses_hist.empty:
-                df_horses_hist = df_horses_hist.dropna(how="all").dropna(axis=1, how="all")
+                df_horses_hist = df_horses_hist.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
                 st.info(f"全 **{len(df_horses_hist)} 頭** の血統データを読み込みました。")
                 
-                csv_horses = df_horses_hist.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    label="📥 horses_master をCSVとしてダウンロード",
-                    data=csv_horses,
-                    file_name=f"horses_master_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
-                )
+                filename_horses = f"horses_master_export_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv"
+                link_html_horses = create_safe_download_link(df_horses_hist, filename_horses, "📥 horses_master をCSV保存（スマホ対応）")
+                st.markdown(link_html_horses, unsafe_allow_html=True)
+
                 st.dataframe(df_horses_hist, use_container_width=True, height=250)
             else:
                 st.info("horses_master タブにデータがありません。")
@@ -613,7 +611,7 @@ with tab4:
             for col in COLUMNS_HORSES:
                 if col not in df_h.columns:
                     df_h[col] = ""
-            df_h = df_h[COLUMNS_HORSES].fillna("")
+            df_h = df_h[COLUMNS_HORSES].fillna("").reset_index(drop=True)
 
             st.success(f"解析成功: **{len(df_h)} 頭** の血統データ（書き込み先: **horses_master**）")
             st.dataframe(df_h, use_container_width=True)
