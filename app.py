@@ -2,6 +2,7 @@
 """
 🐴 自分専用 競馬予想AI（オールインワン版・21列完全統一フォーマット対応）
 - 全処理（予想・ログ保存・一括登録・過去参照）を21列フォーマットで統一
+- 過去データ参照タブのソート・絞り込み機能を完全復元
 - モデル前処理（エンコーダ/欠損補完）、ペース診断、UI/UX配置を完全維持
 - 血統マスタ（horses_master）は馬名・父・母父のみで分離管理
 """
@@ -424,7 +425,7 @@ with tab1:
             st.success("✨ 予想完了＆ `predictions` タブへの21列データ蓄積が完了しました！")
 
 
-# --- TAB 2: 過去データ参照（AI予想の隣に配置） ---
+# --- TAB 2: 過去データ参照（ソート・検索機能付き） ---
 with tab2:
     st.subheader("📊 過去の予想データ参照（predictions タブ）")
     if st.button("🔄 データを再読み込み"):
@@ -435,8 +436,39 @@ with tab2:
         df_hist = conn.read(worksheet="predictions", ttl=0)
         if df_hist is not None and not df_hist.empty:
             df_hist = df_hist.dropna(how="all").dropna(axis=1, how="all")
-            st.success(f"全 {len(df_hist)} 行のデータを読み込みました。")
-            st.dataframe(df_hist, use_container_width=True, height=500)
+            
+            # --- ソート・フィルタリング機能 ---
+            with st.expander("🔍 絞り込み・並び替え設定", expanded=True):
+                fc1, fc2, fc3 = st.columns(3)
+                with fc1:
+                    filter_race_name = st.text_input("レース名で検索", placeholder="例: アンタレス")
+                with fc2:
+                    filter_venue = st.multiselect("競馬場で絞り込み", options=list(df_hist["Venue"].dropna().unique()) if "Venue" in df_hist.columns else [])
+                with fc3:
+                    sort_col = st.selectbox("並び替えの基準列", options=list(df_hist.columns), index=0)
+                    ascending = st.radio("昇順/降順", options=["降順（新しい順/高ランク順）", "昇順"], index=0) == "昇順"
+
+            # フィルタの適用
+            df_filtered = df_hist.copy()
+            if filter_race_name and "Race Name" in df_filtered.columns:
+                df_filtered = df_filtered[df_filtered["Race Name"].astype(str).str.contains(filter_race_name, na=False)]
+            if filter_venue and "Venue" in df_filtered.columns:
+                df_filtered = df_filtered[df_filtered["Venue"].isin(filter_venue)]
+
+            # ソートの適用（数値としてソート可能な列は数値化して正しく並べ替え）
+            if sort_col in df_filtered.columns:
+                try:
+                    num_series = pd.to_numeric(df_filtered[sort_col], errors="coerce")
+                    if num_series.notna().sum() > 0:
+                        df_filtered["_sort_key"] = num_series
+                        df_filtered = df_filtered.sort_values("_sort_key", ascending=ascending).drop(columns=["_sort_key"])
+                    else:
+                        df_filtered = df_filtered.sort_values(sort_col, ascending=ascending)
+                except Exception:
+                    df_filtered = df_filtered.sort_values(sort_col, ascending=ascending)
+
+            st.success(f"表示中: **{len(df_filtered)} / {len(df_hist)} 件** のデータ")
+            st.dataframe(df_filtered, use_container_width=True, height=500)
         else:
             st.info("predictions タブにデータがありません。")
     except Exception as e:
