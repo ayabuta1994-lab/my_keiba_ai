@@ -244,6 +244,53 @@ def ensure_21_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[COLUMNS_21].fillna("").astype(str).copy()
 
 
+def parse_input_table(raw_text: str) -> pd.DataFrame:
+    """21列のCSV/TSVテキストを読み込み、統一した列順のDataFrameを返す。"""
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise ValueError("入力データが空です。競馬データを貼り付けてください。")
+
+    # Excelやスマートフォンからの貼り付けで混在する改行・BOMを整理する。
+    text = raw_text.strip().lstrip("\ufeff")
+    first_line = text.splitlines()[0]
+    delimiter = "\t" if "\t" in first_line else ","
+
+    try:
+        parsed = pd.read_csv(
+            StringIO(text),
+            sep=delimiter,
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            skip_blank_lines=True,
+            engine="python",
+        )
+    except Exception as exc:
+        raise ValueError(f"CSV/TSVを解析できませんでした。区切り文字や引用符を確認してください。詳細: {exc}") from exc
+
+    if parsed.empty:
+        raise ValueError("読み取れるデータ行がありません。")
+
+    # 先頭行が21列の正式なヘッダーなら除外する。ヘッダーなし形式も受け付ける。
+    first_values = [str(v).strip().lstrip("\ufeff") for v in parsed.iloc[0].tolist()]
+    normalized = [norm(v) for v in first_values]
+    expected = [norm(v) for v in COLUMNS_21]
+    has_header = len(first_values) == len(COLUMNS_21) and normalized == expected
+    if has_header:
+        parsed = parsed.iloc[1:].reset_index(drop=True)
+
+    if parsed.empty:
+        raise ValueError("ヘッダー行しかありません。競走馬のデータ行も貼り付けてください。")
+
+    if len(parsed.columns) != len(COLUMNS_21):
+        raise ValueError(
+            f"列数が不正です。21列必要ですが、{len(parsed.columns)}列検出されました。"
+            "カンマ区切りCSVまたはタブ区切りTSVを貼り付けてください。"
+        )
+
+    parsed.columns = COLUMNS_21
+    return ensure_21_columns(parsed)
+
+
 def parse_tactics(v):
     if pd.isna(v) or v is None:
         return np.nan
