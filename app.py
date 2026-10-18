@@ -60,34 +60,130 @@ def load_model():
     with open(MODEL_PATH, "rb") as f:
         obj = pickle.load(f)
 
+    # 新しい学習スクリプトが出力する win/top3 のモデル束をそのまま保持する。
+    if isinstance(obj, dict) and isinstance(obj.get("models"), dict):
+        if not all(k in obj["models"] for k in ("win", "top3")):
+            raise ValueError("model.pkl の models に win / top3 がありません。Kaggleで最新の train_model.py を再実行してください。")
+        return obj, {"bundle": obj, "features": list(obj.get("features", [])), "encoders": obj.get("encoders", {})}
+
+    # 旧モデルとの後方互換性（新しい学習モデル利用時は上の分岐）。
     meta = {"features": None, "encoders": {}}
     model = obj
-
     if isinstance(obj, dict):
-        model = None
-        for k in ("model", "pipeline", "clf", "estimator", "booster", "lgbm", "xgb"):
-            if k in obj:
-                model = obj[k]
-                break
+        model = next((obj[k] for k in ("model", "pipeline", "clf", "estimator", "booster", "lgbm", "xgb") if k in obj), None)
         if model is None:
             model = next((v for v in obj.values() if hasattr(v, "predict")), None)
         for k in ("features", "feature_names", "feature_cols", "feature_columns", "columns"):
             if k in obj and obj[k] is not None:
-                meta["features"] = list(obj[k])
-                break
+                meta["features"] = list(obj[k]); break
         for k in ("encoders", "label_encoders", "encoder", "le_dict"):
             if k in obj and isinstance(obj[k], dict):
-                meta["encoders"] = obj[k]
-                break
+                meta["encoders"] = obj[k]; break
     elif isinstance(obj, (tuple, list)):
         model = next((v for v in obj if hasattr(v, "predict")), None)
         for v in obj:
-            if isinstance(v, dict) and not meta["encoders"]:
-                meta["encoders"] = v
-            elif isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v):
-                meta["features"] = list(v)
-
+            if isinstance(v, dict) and not meta["encoders"]: meta["encoders"] = v
+            elif isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v): meta["features"] = list(v)
     return model, meta
+
+
+def _norm_horse(v):
+    return re.sub(r"[\s\u200b-\u200f\u2060\ufeff]", "", str(v or ""))
+
+
+def _load_local_history():
+    """学習時に出力した21列CSVを推論時の過去戦績参照に使う。"""
+    p = Path(__file__).parent / "training_data_21cols.csv"
+    if not p.exists():
+        return pd.DataFrame(columns=COLUMNS_21)
+    try:
+        hist = pd.read_csv(p, dtype=str, low_memory=False)
+        return ensure_21_columns(hist)
+    except Exception:
+        return pd.DataFrame(columns=COLUMNS_21)
+
+
+def _new_model_matrix(df, bundle):
+    features = list(bundle["features"])
+    numeric = set(bundle.get("numeric_features", []))
+    categorical = set(bundle.get("categorical_features", []))
+    encoders = bundle.get("encoders", {})
+    hist = _load_local_history()
+    # Google Sheets に蓄積済みの予想・結果も過去戦績に加える（読み取りに失敗しても予想自体は続行）。
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        sheet_hist = conn.read(worksheet="predictions", ttl=0)
+        if sheet_hist is not None and not sheet_hist.empty:
+            hist = pd.concat([hist, ensure_21_columns(sheet_hist)], ignore_index=True)
+    except Exception:
+        pass
+    hist = ensure_21_columns(hist).drop_duplicates(
+        subset=["Race Day", "Race Name", "Venue", "Horse Number", "Horse Name"], keep="last"
+    )
+    hist["_day"] = pd.to_datetime(hist["Race Day"], errors="coerce")
+    hist["_placing"] = to_number(hist["Placing"])
+    hist["_last3f"] = to_number(hist["Last 3F"])
+    hist["_tactics"] = hist["Tactics"].map(parse_tactics)
+
+    # 血統はローカルのMASTERを優先。MASTERが無い場合も未知カテゴリとして扱う。
+    pedigree = {}
+    hp = Path(__file__).parent / "horses_master_export_20261018_125756.csv"
+    if hp.exists():
+        try:
+            hdf = pd.read_csv(hp, dtype=str, low_memory=False).fillna("")
+            if "Horse Name" in hdf.columns:
+                for _, hr in hdf.iterrows():
+                    pedigree[_norm_horse(hr.get("Horse Name", ""))] = (hr.get("Sire", ""), hr.get("Dam's Sire", ""))
+        except Exception:
+            pass
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        shorses = conn.read(worksheet="horses_master", ttl=0)
+        if shorses is not None and not shorses.empty and "Horse Name" in shorses.columns:
+            for _, hr in shorses.fillna("").iterrows():
+                pedigree[_norm_horse(hr.get("Horse Name", ""))] = (hr.get("Sire", ""), hr.get("Dam's Sire", ""))
+    except Exception:
+        pass
+
+    rows = []
+    for _, r in df.iterrows():
+        horse_key = _norm_horse(r.get("Horse Name", ""))
+        race_day = pd.to_datetime(r.get("Race Day", ""), errors="coerce")
+        past = hist[(hist["Horse Name"].map(_norm_horse) == horse_key) & hist["_day"].notna() & (hist["_day"] < race_day)]
+        past = past.sort_values("_day")
+        last3 = past.tail(3)
+        placings = past["_placing"].dropna()
+        last3f = last3["_last3f"].dropna()
+        prev3f = past["_last3f"].dropna()
+        sire, damsire = pedigree.get(horse_key, ("Unknown", "Unknown"))
+        row = {
+            "Distance": r.get("Distance", 1800), "Bracket": r.get("Bracket", 0),
+            "Horse Number": r.get("Horse Number", 0), "Horse Age": r.get("Horse Age", 4),
+            "Burden Weight": r.get("Burden Weight", 55), "Track_Type": r.get("Track_Type", 1),
+            "Hist_Starts": float(len(placings)),
+            "Hist_Win_Rate": float((placings == 1).mean()) if len(placings) else 0.0,
+            "Hist_Top3_Rate": float((placings <= 3).mean()) if len(placings) else 0.0,
+            "Hist_Mean_Placing3": float(last3["_placing"].dropna().mean()) if last3["_placing"].notna().any() else 0.0,
+            "Hist_Last3F_Mean3": float(last3f.mean()) if len(last3f) else 0.0,
+            "Hist_Last3F_Last": float(prev3f.iloc[-1]) if len(prev3f) else 0.0,
+            "Hist_Last_Tactics": float(past["_tactics"].dropna().iloc[-1]) if past["_tactics"].notna().any() else 0.0,
+            "Race Name": r.get("Race Name", "Unknown"), "Venue": r.get("Venue", "Unknown"),
+            "Track Condition": r.get("Track Condition", "Unknown"), "Weather": r.get("Weather", "Unknown"),
+            "Horse Name": r.get("Horse Name", "Unknown"), "Sex": r.get("Sex", "Unknown"),
+            "Jockey": r.get("Jockey", "Unknown"), "Trainer": r.get("Trainer", "Unknown"),
+            "Sire": sire or "Unknown", "Dam's Sire": damsire or "Unknown",
+        }
+        rows.append(row)
+    X = pd.DataFrame(rows, columns=features)
+    for c in features:
+        if c in categorical:
+            mapping = encoders.get(c, {})
+            X[c] = X[c].fillna("Unknown").astype(str).map(mapping).fillna(-1).astype("int32")
+        elif c in numeric:
+            X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0).astype(float)
+        else:
+            X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0)
+    return X
 
 
 @st.cache_resource
@@ -429,6 +525,7 @@ with tab1:
         else:
             try:
                 raw_df = parse_input_table(csv_text)
+                st.session_state.pop("top3_probabilities", None)
                 now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
                 defaults_map = {
@@ -445,12 +542,20 @@ with tab1:
                 df = preprocess(raw_df, defaults_map)
                 pace = diagnose_pace(df)
 
-                feats = get_feature_names_custom(model, meta) or [
-                    "Bracket", "Horse Number", "Horse Age", "Burden Weight", "Tactics", "Distance", "Last 3F"
-                ]
-                X, missing = build_X(df, feats)
-                X, hashed = encode_X(X, model, meta)
-                proba = predict_top3(model, X)
+                if isinstance(model, dict) and isinstance(model.get("models"), dict):
+                    # 学習済みの23特徴量・保存済みカテゴリ辞書を使い、勝率モデルで順位付けする。
+                    X = _new_model_matrix(df, model)
+                    proba = np.asarray(model["models"]["win"].predict(X, num_iteration=getattr(model["models"]["win"], "best_iteration", None)), dtype=float)
+                    # 複勝（3着以内）モデルも同じ入力で計算し、結果診断用に保持。
+                    top3_proba = np.asarray(model["models"]["top3"].predict(X, num_iteration=getattr(model["models"]["top3"], "best_iteration", None)), dtype=float)
+                    st.session_state["top3_probabilities"] = np.round(top3_proba * 100, 1).tolist()
+                else:
+                    feats = get_feature_names_custom(model, meta) or [
+                        "Bracket", "Horse Number", "Horse Age", "Burden Weight", "Tactics", "Distance", "Last 3F"
+                    ]
+                    X, missing = build_X(df, feats)
+                    X, hashed = encode_X(X, model, meta)
+                    proba = predict_top3(model, X)
                 proba_pct = np.round(np.asarray(proba, dtype=float) * 100, 1)
 
                 df["AI_Probability"] = proba_pct.astype(str)
