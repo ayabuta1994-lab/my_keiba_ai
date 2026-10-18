@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-🏇 自分専用 競馬予想AI（オールインワン版・血統マスタ簡素化）
-- AI予想実行 & predictionsへの自動保存
-- 過去データ参照（AI予想の隣）
-- 過去レースデータ一括登録（タブ選択可・血統タブ除外）
-- 血統データ一括登録（horses_master専用：馬名・父・母父のみ）
+🏇 自分専用 競馬予想AI（オールインワン版・Secrets修正対応）
 """
 import io
 import pickle
@@ -22,7 +18,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from streamlit_gsheets import GSheetsConnection
 
-st.set_page_config(page_title="競馬予想AI オールインワン", page_icon="🏇", layout="wide")
+st.set_page_config(page_title="競馬予想AI オールインワン", page_icon="🐴", layout="wide")
+
 
 MODEL_PATH = Path(__file__).parent / "model.pkl"
 JST = timezone(timedelta(hours=9))
@@ -53,7 +50,6 @@ COLUMNS_PREDICTIONS = [
     "Rank", "Horse Number", "Horse Name", "Sire", "Dam's Sire", "Tactics", "AI Probability"
 ]
 
-# 血統マスタ（horses_master）用：馬名・父・母父のみに限定
 COLUMNS_HORSES = [
     "Horse Name", "Sire", "Dam's Sire"
 ]
@@ -102,15 +98,23 @@ def load_model():
 
 @st.cache_resource
 def get_gspread_client():
-    creds_dict = dict(st.secrets["gcp_service_account"])
+    # [connections.gsheets] の設定を直接読み込むように修正
+    creds_dict = dict(st.secrets["connections.gsheets"])
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
-    spreadsheet_id = st.secrets["spreadsheet_id"]
-    return gc.open_by_key(spreadsheet_id)
+    
+    spreadsheet_ref = creds_dict.get("spreadsheet")
+    if not spreadsheet_ref:
+        raise ValueError("Secretsの [connections.gsheets] に spreadsheet が設定されていません。")
+    
+    if "spreadsheets/d/" in spreadsheet_ref:
+        return gc.open_by_url(spreadsheet_ref)
+    else:
+        return gc.open_by_key(spreadsheet_ref)
 
 
 def parse_csv(text: str) -> pd.DataFrame:
