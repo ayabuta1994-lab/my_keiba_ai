@@ -1,8 +1,0 @@
-streamlit
-pandas
-numpy
-lightgbm
-scikit-learn
-gspread
-google-auth
-st-gsheets-connection
