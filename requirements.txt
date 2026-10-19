@@ -1,0 +1,9 @@
+streamlit>=1.40
+pandas
+numpy
+lightgbm
+scikit-learn
+matplotlib
+gspread>=6.0
+google-auth
+requests
