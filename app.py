@@ -145,6 +145,11 @@ def reference_position(v):
         if pd.notna(p) and p > 0: return p
     return np.nan
 
+def last_corner_position(v):
+    """Last recorded corner position; used for prior-run position/recovery features."""
+    positions = [p for p in parse_passing(v) if pd.notna(p) and p > 0]
+    return positions[-1] if positions else np.nan
+
 
 def derive_tactics(df):
     """Passing(1〜2角)から v4.2 定量化脚質(1逃げ/2先行/3差し/4追込)。train_kaggle.py と同一ルール。"""
@@ -169,34 +174,41 @@ def derive_tactics(df):
 #   当日馬場バイアス・回収率系の指標は意図的に学習へ入れない（ノイズ・過学習防止）。
 # ======================================================================
 from collections import defaultdict
-FEATURE_VERSION = "v4.4-23col-relative"
-SM_A = 5.0                                   # 平滑化の強さ（疑似試行数）
+FEATURE_VERSION = "v7.2-multisource-history"
+SM_A = 5.0
 PRIOR_WIN, PRIOR_TOP3, PRIOR_FRONT = 0.07, 0.21, 0.35
+
 HIST_FEATURES = ["Hist_Starts", "Hist_Win_Rate", "Hist_Top3_Rate", "Hist_Mean_Placing3", "Hist_Last3F_Mean3", "Hist_Last3F_Last",
                  "Hist_Last_Tactics", "Rel_Last_Margin", "Rel_Last3F_Diff", "Rel_Last3F_Pct", "Rel_Last_Margin_Mean3", "Rel_Last3F_Diff_Mean3",
-                 "Hist_Rest_Days"]
+                 "Hist_Rest_Days", "Rel_Last_Pos_Recovery"]
+
 COND_FEATURES = ["Hist_Dist_Win", "Hist_Dist_Top3", "Hist_Going_Top3", "Hist_Venue_Top3",
-                 "Jockey_VD_Win", "Jockey_VD_Top3", "Trainer_VD_Win", "Trainer_VD_Top3",
-                 "Sire_Cond_Top3", "DamSire_Cond_Top3", "Course_Front_Rate", "Class_Level", "Class_Change", "Field_Type"]
-# ⑤ 前走からの変化（ローテーション・条件替わり）：今回の出走条件(事前に判明) と 過去走(前走・前々走) だけから計算
+                 "Jockey_VD_Top3", "Trainer_VD_Top3",
+                 "Sire_Cond_Top3", "DamSire_Cond_Top3", "Course_Front_Rate", "Class_Level", "Class_Change", "Field_Type", "Dist_Cat"]
+
 CHANGE_FEATURES = ["Diff_Distance", "Diff_Burden_Weight", "Rest_Type", "Rest_Is_Short", "Rest_Is_Long",
                    "Class_Up", "Class_Same", "Class_Down", "Hist_Prev_Tactics", "Tactics_Change", "Tactics_Changed"]
-BUILDER_FEATURES = HIST_FEATURES + COND_FEATURES + CHANGE_FEATURES
+STAMINA_FEATURES = ["Max_Past_Dist", "Dist_Over_Max", "Past_Long_Starts", "Past_Long_Top3_Rate"]
+LONG_EXP_DIST = 2400
+PREP_RACES = {1: r"セントライト記念|神戸新聞杯|東京優駿|日本ダービー|ラジオNIKKEI賞", 2: r"阪神大賞典|日経賞|大阪杯|ダイヤモンドS|有馬記念", 3: r"天皇賞.{0,2}秋|ジャパンカップ|菊花賞|アルゼンチン共和国杯|ステイヤーズS"}
+PREP_RE = {k: re.compile(v) for k, v in PREP_RACES.items()}
+PREP_FEATURES = ["Prep_Last_Is_Key", "Prep_Last_Placing", "Prep_Last_Margin", "Prep_Last3F_Diff", "Prep_Key_In_Last3"]
+GOING_FEATURES = ["Going_Fit", "Going_Starts", "Is_Heavy_Going", "Going_Fit_Heavy", "Sire_Going_Fit", "DamSire_Going_Fit"]
+POS_FEATURES = ["Hist_CornerPos_Last", "Hist_CornerPos_Mean3"]
 
-def _sm(n, k, p):
-    return (k + SM_A * p) / (n + SM_A)
+PEOPLE_STAT_FEATURES = ["Jockey_Top3_All", "Trainer_Top3_All", "Sire_Top3_All", "DamSire_Top3_All"]
+BUILDER_FEATURES = HIST_FEATURES + COND_FEATURES + CHANGE_FEATURES + STAMINA_FEATURES + GOING_FEATURES + POS_FEATURES + PEOPLE_STAT_FEATURES
 
-def dist_cat(d):
-    """0:短距離(<1400) 1:マイル(1400-1799) 2:中長距離(1800+)"""
-    if pd.isna(d): return 1
-    return 0 if d < 1400 else (1 if d < 1800 else 2)
-
+def _sm(n, k, p): return (k + SM_A * p) / (n + SM_A)
+def dist_cat(d): return 0 if pd.isna(d) or d < 1400 else (1 if d < 1800 else (2 if d <= 2400 else 3))
 def going_class(s):
-    """0:良 1:稍重〜不良（道悪）"""
-    return 1 if str(s).strip() in ("稍重", "重", "不良", "稍", "不") else 0
-
+    """0=good, 1=any wet/heavy going, 2=unknown (not conflated with good)."""
+    if pd.isna(s): return 2
+    v = unicodedata.normalize("NFKC", str(s)).strip()
+    if v in ("良", "0", "0.0"): return 0
+    if v in ("稍重", "重", "不良", "稍", "不", "1.0", "2.0", "3.0", "1", "2", "3"): return 1
+    return 2
 def class_level(name):
-    """レース名からクラス段階を推定。0新馬 1未勝利 2:1勝 3:2勝 4:3勝 5:OP/L 6:G3 7:G2 8:G1（不明はNaN）"""
     s = unicodedata.normalize("NFKC", str(name)).upper().replace("Ⅲ", "III").replace("Ⅱ", "II").replace("Ⅰ", "I")
     if re.search(r"G\s*(1|I)(?![I0-9])", s): return 8.0
     if re.search(r"G\s*(2|II)(?!I)", s): return 7.0
@@ -210,39 +222,42 @@ def class_level(name):
     return np.nan
 
 def prep_columns(df):
-    """23列DataFrame(+Race_ID/Horse_Key/Sire/Dam's Sire/Placing_num/Tactics数値)に特徴量計算用の内部列(_xxx)を追加して返す。"""
     d = df.copy()
     g = d.groupby("Race_ID")
     d["_day"] = pd.to_datetime(d["Race Day"], errors="coerce")
-    d["_horse"] = d["Horse_Key"]
-    d["_venue"] = d["Venue"].map(norm_name)
+    d["_horse"], d["_venue"] = d["Horse_Key"], d["Venue"].map(norm_name)
+    d["_rname"] = d["Race Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x))
+    d["_rg"] = d["Race Name"].map(race_group_code)
     d["_dist"] = pd.to_numeric(d["Distance"], errors="coerce")
     d["_bw"] = pd.to_numeric(d["Burden Weight"], errors="coerce")
     d["_tt"] = pd.to_numeric(d["Track_Type"], errors="coerce")
     d["_going"] = d["Track Condition"].map(going_class)
     d["_dc"] = d["_dist"].map(dist_cat)
-    cs = d["Class_Src"].fillna("").astype(str) if "Class_Src" in d.columns else pd.Series("", index=d.index)    # ベースCSV由来の補助情報(競争条件・グレード)。無ければレース名のみ
+    cs = d["Class_Src"].fillna("").astype(str) if "Class_Src" in d.columns else pd.Series("", index=d.index)
     d["_cls"] = pd.Series(np.where(cs.str.strip() != "", d["Race Name"].astype(str) + " " + cs, d["Race Name"].astype(str)), index=d.index).map(class_level)
     d["_field"] = g["Horse Name"].transform("size").astype(float)
     d["_pl"] = pd.to_numeric(d["Placing_num"], errors="coerce")
     d["_l3f"] = pd.to_numeric(d["Last 3F"], errors="coerce")
     d["_l3d"] = d["_l3f"] - d.groupby("Race_ID")["_l3f"].transform("min")
     d["_pr"] = (d["_pl"] - 1) / np.maximum(d["_field"] - 1, 1)
-    d["_l3p"] = (d.groupby("Race_ID")["_l3f"].rank(method="min", ascending=True) - 1) / np.maximum(d.groupby("Race_ID")["_l3f"].transform("count") - 1, 1)   # そのレースでの上がり3F順位(0=最速)
+    if "Passing" in d.columns:
+        # Use the last recorded corner (usually 4C on four-corner courses), not
+        # the first two corner positions used by the running-style classifier.
+        ref = d["Passing"].map(last_corner_position)
+        n_eff = np.maximum(d["_field"], ref.groupby(d["Race_ID"]).transform("max").fillna(0))
+        d["_cpf"] = ref / n_eff.where(n_eff > 0)
+    else: d["_cpf"] = np.nan
+    d["_l3p"] = (d.groupby("Race_ID")["_l3f"].rank(method="min", ascending=True) - 1) / np.maximum(d.groupby("Race_ID")["_l3f"].transform("count") - 1, 1)
     d["_tac"] = pd.to_numeric(d["Tactics"], errors="coerce")
-    d["_jk"] = d["Jockey"].map(norm_name)
-    d["_tr"] = d["Trainer"].map(norm_name)
-    d["_sire"] = d["Sire"].fillna("Unknown").astype(str)
-    d["_dam"] = d["Dam's Sire"].fillna("Unknown").astype(str)
+    d["_jk"], d["_tr"] = d["Jockey"].map(norm_name), d["Trainer"].map(norm_name)
+    d["_sire"], d["_dam"] = d["Sire"].fillna("Unknown").astype(str), d["Dam's Sire"].fillna("Unknown").astype(str)
     return d
 
-INTERNAL_COLS = ["_day", "_horse", "_venue", "_dist", "_bw", "_tt", "_going", "_dc", "_cls", "_field", "_pl", "_l3f", "_l3d", "_l3p", "_pr", "_tac", "_jk", "_tr", "_sire", "_dam"]
+INTERNAL_COLS = ["_day", "_horse", "_venue", "_rname", "_rg", "_dist", "_bw", "_tt", "_going", "_dc", "_cls", "_field", "_pl", "_l3f", "_l3d", "_l3p", "_pr", "_cpf", "_tac", "_jk", "_tr", "_sire", "_dam"]
 
 class FeatureBuilder:
-    """時系列に沿って過去成績を蓄積し、『その時点までの情報だけ』から特徴量を返す。"""
     def __init__(self):
-        self.h = defaultdict(list)   # 馬 -> 過去走リスト（時系列順）
-        self.c = {}                  # 条件キー -> [出走数, 勝利数, 3着内数]
+        self.h = defaultdict(list); self.c = {}
     def _bump(self, key, w, t):
         v = self.c.get(key)
         if v is None: v = self.c[key] = [0, 0, 0]
@@ -252,7 +267,9 @@ class FeatureBuilder:
         dc, gc, vn = r["_dc"], r["_going"], r["_venue"]
         return [("hd", r["_horse"], dc), ("hg", r["_horse"], gc), ("hv", r["_horse"], vn),
                 ("jvd", r["_jk"], vn, dc), ("tvd", r["_tr"], vn, dc),
-                ("sc", r["_sire"], vn, dc, gc), ("dm", r["_dam"], vn, dc, gc)]
+                ("sc", r["_sire"], vn, dc, gc), ("dm", r["_dam"], vn, dc, gc),
+                ("sg", r["_sire"], gc), ("dg", r["_dam"], gc), ("sa", r["_sire"]), ("da", r["_dam"]),
+                ("ja", r["_jk"]), ("ta", r["_tr"])]
     def add(self, r):
         pl = r["_pl"]
         if pd.isna(pl): return
@@ -260,44 +277,62 @@ class FeatureBuilder:
         for k in self._keys(r):
             if k[1] in ("", "Unknown"): continue
             self._bump(k, w, t)
-        if pd.notna(r["_tac"]):
-            self._bump(("course", r["_venue"], r["_dist"], r["_tt"]), int(r["_tac"] in (1, 2)), 0)
+        if pd.notna(r["_tac"]): self._bump(("course", r["_venue"], r["_dist"], r["_tt"]), int(r["_tac"] in (1, 2)), 0)
         self.h[r["_horse"]].append(r)
     def _rate(self, key, col, prior):
-        v = self.c.get(key)
-        return _sm(v[0], v[col], prior) if v else prior
+        v = self.c.get(key); return _sm(v[0], v[col], prior) if v else prior
+    def _balance_features(self, r, past):
+        hs, gc = r["_horse"], r["_going"]
+        n = len(past); k3 = sum(1 for p in past if p["_pl"] <= 3)
+        overall = _sm(n, k3, PRIOR_TOP3)
+        gfit = self._rate(("hg", hs, gc), 2, PRIOR_TOP3) - overall
+        v = self.c.get(("hg", hs, gc))
+        cps = [p.get("_cpf", np.nan) for p in past[-3:] if pd.notna(p.get("_cpf", np.nan))]
+        lastcp = past[-1].get("_cpf", np.nan) if n and pd.notna(past[-1].get("_cpf", np.nan)) else None
+        sire, dam, jk, tr = r["_sire"], r["_dam"], r["_jk"], r["_tr"]
+        return {
+            "Going_Fit": float(gfit), "Going_Starts": float(v[0]) if v else 0.0, "Is_Heavy_Going": float(gc),
+            "Going_Fit_Heavy": float(gfit) if gc == 1 else 0.0,
+            "Sire_Going_Fit": self._rate(("sg", sire, gc), 2, PRIOR_TOP3) - self._rate(("sa", sire), 2, PRIOR_TOP3),
+            "DamSire_Going_Fit": self._rate(("dg", dam, gc), 2, PRIOR_TOP3) - self._rate(("da", dam), 2, PRIOR_TOP3),
+            "Hist_CornerPos_Last": float(lastcp) if lastcp is not None else -1.0,
+            "Hist_CornerPos_Mean3": float(np.mean(cps)) if cps else -1.0,
+            "Jockey_Top3_All": self._rate(("ja", jk), 2, PRIOR_TOP3),
+            "Trainer_Top3_All": self._rate(("ta", tr), 2, PRIOR_TOP3),
+            "Sire_Top3_All": self._rate(("sa", sire), 2, PRIOR_TOP3), "DamSire_Top3_All": self._rate(("da", dam), 2, PRIOR_TOP3),
+        }
+
+    @staticmethod
+    def _prep_features(r, past):
+        out = {"Prep_Last_Is_Key": 0.0, "Prep_Last_Placing": 0.0, "Prep_Last_Margin": -1.0, "Prep_Last3F_Diff": -1.0, "Prep_Key_In_Last3": 0.0}
+        g = int(r.get("_rg", 0) or 0)
+        if g == 0 or not past: return out
+        pat = PREP_RE[g]; out["Prep_Key_In_Last3"] = float(any(pat.search(p["_rname"]) for p in past[-3:]))
+        last = past[-1]
+        if pat.search(last["_rname"]):
+            out.update({"Prep_Last_Is_Key": 1.0, "Prep_Last_Placing": float(last["_pl"]), "Prep_Last_Margin": float(last["_pr"]) if pd.notna(last["_pr"]) else -1.0, "Prep_Last3F_Diff": float(last["_l3d"]) if pd.notna(last["_l3d"]) else -1.0})
+        return out
+
+    @staticmethod
+    def _stamina_features(r, past):
+        dists = [(p["_dist"], p["_pl"]) for p in past if pd.notna(p["_dist"])]
+        cur, mx = r["_dist"], max((d for d, _ in dists), default=None)
+        longs = [pl for d, pl in dists if d >= LONG_EXP_DIST]
+        return {"Max_Past_Dist": float(mx) if mx is not None else 0.0, "Dist_Over_Max": float(cur - mx) if (mx is not None and pd.notna(cur)) else 0.0, "Past_Long_Starts": float(len(longs)), "Past_Long_Top3_Rate": _sm(len(longs), sum(1 for x in longs if x <= 3), PRIOR_TOP3)}
+
     @staticmethod
     def _change_features(r, past, tac, last):
-        """前走からの変化。past末尾=前走、tac(脚質が判明している過去走)末尾=前走脚質・その前=前々走脚質。"""
-        def diff(cur, prv):
-            return float(cur - prv) if (pd.notna(cur) and pd.notna(prv)) else 0.0
-        days = None
-        if last is not None and pd.notna(r["_day"]) and pd.notna(last["_day"]):
-            days = (r["_day"] - last["_day"]).days
-        if days is None: rtype = 0.0                                   # 0:初出走/不明
-        elif days <= 21: rtype = 1.0                                   # 1:連闘〜中2週以内(21日以内)
-        elif days <= 42: rtype = 2.0                                   # 2:通常ローテ(〜中5週)
-        elif days <= 89: rtype = 3.0                                   # 3:やや間隔あり(〜3か月未満)
-        elif days <= 179: rtype = 4.0                                  # 4:休み明け(90日以上)
-        else: rtype = 5.0                                              # 5:長期休養明け(180日以上)
+        def diff(cur, prv): return float(cur - prv) if (pd.notna(cur) and pd.notna(prv)) else 0.0
+        days = (r["_day"] - last["_day"]).days if (last is not None and pd.notna(r["_day"]) and pd.notna(last["_day"])) else None
+        rtype = 0.0 if days is None else (1.0 if days <= 21 else (2.0 if days <= 42 else (3.0 if days <= 89 else (4.0 if days <= 179 else 5.0))))
         cur, prv = r["_cls"], (last["_cls"] if last is not None else np.nan)
         known = pd.notna(cur) and pd.notna(prv)
-        last_t = tac[-1] if len(tac) >= 1 else None
-        prev_t = tac[-2] if len(tac) >= 2 else None
+        last_t, prev_t = tac[-1] if len(tac) >= 1 else None, tac[-2] if len(tac) >= 2 else None
         both = last_t is not None and prev_t is not None
-        return {
-            "Diff_Distance": diff(r["_dist"], last["_dist"]) if last is not None else 0.0,          # +:距離延長 / -:距離短縮
-            "Diff_Burden_Weight": diff(r["_bw"], last["_bw"]) if last is not None else 0.0,         # -:斤量減(恩恵) / +:斤量増
-            "Rest_Type": rtype,
-            "Rest_Is_Short": 1.0 if rtype == 1.0 else 0.0,
-            "Rest_Is_Long": 1.0 if rtype >= 4.0 else 0.0,
-            "Class_Up": 1.0 if known and cur > prv else 0.0,                                        # 昇級戦
-            "Class_Same": 1.0 if known and cur == prv else 0.0,                                     # 同クラス戦
-            "Class_Down": 1.0 if known and cur < prv else 0.0,                                      # 降級戦
-            "Hist_Prev_Tactics": float(prev_t) if prev_t is not None else 0.0,                      # 前々走の脚質
-            "Tactics_Change": float(last_t - prev_t) if both else 0.0,                              # 前走-前々走（+:後ろ寄りへ / -:前寄りへ）
-            "Tactics_Changed": 1.0 if both and last_t != prev_t else 0.0,
-        }
+        return {"Diff_Distance": diff(r["_dist"], last["_dist"]) if last is not None else 0.0, "Diff_Burden_Weight": diff(r["_bw"], last["_bw"]) if last is not None else 0.0,
+                "Rest_Type": rtype, "Rest_Is_Short": 1.0 if rtype == 1.0 else 0.0, "Rest_Is_Long": 1.0 if rtype >= 4.0 else 0.0,
+                "Class_Up": 1.0 if known and cur > prv else 0.0, "Class_Same": 1.0 if known and cur == prv else 0.0, "Class_Down": 1.0 if known and cur < prv else 0.0,
+                "Hist_Prev_Tactics": float(prev_t) if prev_t is not None else 0.0, "Tactics_Change": float(last_t - prev_t) if both else 0.0, "Tactics_Changed": 1.0 if both and last_t != prev_t else 0.0}
 
     def features(self, r):
         past = self.h.get(r["_horse"], []); n = len(past)
@@ -308,39 +343,36 @@ class FeatureBuilder:
         last = past[-1] if n else None
         vn, dc, gc = r["_venue"], r["_dc"], r["_going"]
         cl = r["_cls"]; fs = r.get("_field", np.nan)
-        pr3 = [p["_pr"] for p in l3 if pd.notna(p["_pr"])]
-        l3d3 = [p["_l3d"] for p in l3 if pd.notna(p["_l3d"])]
+        pr3 = [p["_pr"] for p in l3 if pd.notna(p["_pr"])]; l3d3 = [p["_l3d"] for p in l3 if pd.notna(p["_l3d"])]
+        
+        pos_recovery = 0.0
+        if last is not None and pd.notna(last.get("_cpf")) and pd.notna(last.get("_pl")) and pd.notna(last.get("_field")):
+            last_corner_pos = last["_cpf"] * last["_field"]
+            pos_recovery = float(last_corner_pos - last["_pl"])
+
         f = {
-            "Hist_Starts": float(n),
-            "Hist_Win_Rate": float(np.mean([x == 1 for x in pls])) if n else 0.0,
-            "Hist_Top3_Rate": float(np.mean([x <= 3 for x in pls])) if n else 0.0,
-            "Hist_Mean_Placing3": float(np.mean([p["_pl"] for p in l3])) if l3 else 0.0,
-            "Hist_Last3F_Mean3": float(np.mean(l3f3)) if l3f3 else 0.0,
-            "Hist_Last3F_Last": float(l3all[-1]) if l3all else 0.0,
-            "Hist_Last_Tactics": float(tac[-1]) if tac else 0.0,
-            # --- 前走レース内での相対評価（-1=データなし）---
-            "Rel_Last_Margin": float(last["_pr"]) if last is not None and pd.notna(last["_pr"]) else -1.0,      # 前走の相対着順 (着順-1)/(頭数-1)  ※着差(秒)列が無いため代替
-            "Rel_Last3F_Diff": float(last["_l3d"]) if last is not None and pd.notna(last["_l3d"]) else -1.0,    # 前走の上がり3F - 前走メンバー最速(秒)
-            "Rel_Last3F_Pct": float(last["_l3p"]) if last is not None and pd.notna(last["_l3p"]) else -1.0,     # 前走の上がり3F順位の相対位置(0=最速)
-            "Rel_Last_Margin_Mean3": float(np.mean(pr3)) if pr3 else -1.0,                                      # 直近3走平均（安定化）
-            "Rel_Last3F_Diff_Mean3": float(np.mean(l3d3)) if l3d3 else -1.0,
+            "Hist_Starts": float(n), "Hist_Win_Rate": float(np.mean([x == 1 for x in pls])) if n else 0.0, "Hist_Top3_Rate": float(np.mean([x <= 3 for x in pls])) if n else 0.0,
+            "Hist_Mean_Placing3": float(np.mean([p["_pl"] for p in l3])) if l3 else 0.0, "Hist_Last3F_Mean3": float(np.mean(l3f3)) if l3f3 else 0.0,
+            "Hist_Last3F_Last": float(l3all[-1]) if l3all else 0.0, "Hist_Last_Tactics": float(tac[-1]) if tac else 0.0,
+            "Rel_Last_Margin": float(last["_pr"]) if last is not None and pd.notna(last["_pr"]) else -1.0,
+            "Rel_Last3F_Diff": float(last["_l3d"]) if last is not None and pd.notna(last["_l3d"]) else -1.0,
+            "Rel_Last3F_Pct": float(last["_l3p"]) if last is not None and pd.notna(last["_l3p"]) else -1.0,
+            "Rel_Last_Margin_Mean3": float(np.mean(pr3)) if pr3 else -1.0, "Rel_Last3F_Diff_Mean3": float(np.mean(l3d3)) if l3d3 else -1.0,
             "Hist_Rest_Days": float(min((r["_day"] - last["_day"]).days, 365)) if last is not None and pd.notna(r["_day"]) and pd.notna(last["_day"]) else -1.0,
-            "Hist_Dist_Win": self._rate(("hd", r["_horse"], dc), 1, PRIOR_WIN),
-            "Hist_Dist_Top3": self._rate(("hd", r["_horse"], dc), 2, PRIOR_TOP3),
-            "Hist_Going_Top3": self._rate(("hg", r["_horse"], gc), 2, PRIOR_TOP3),
-            "Hist_Venue_Top3": self._rate(("hv", r["_horse"], vn), 2, PRIOR_TOP3),
-            "Jockey_VD_Win": self._rate(("jvd", r["_jk"], vn, dc), 1, PRIOR_WIN),
+            "Rel_Last_Pos_Recovery": pos_recovery,
+            "Hist_Dist_Win": self._rate(("hd", r["_horse"], dc), 1, PRIOR_WIN), "Hist_Dist_Top3": self._rate(("hd", r["_horse"], dc), 2, PRIOR_TOP3),
+            "Hist_Going_Top3": self._rate(("hg", r["_horse"], gc), 2, PRIOR_TOP3), "Hist_Venue_Top3": self._rate(("hv", r["_horse"], vn), 2, PRIOR_TOP3),
             "Jockey_VD_Top3": self._rate(("jvd", r["_jk"], vn, dc), 2, PRIOR_TOP3),
-            "Trainer_VD_Win": self._rate(("tvd", r["_tr"], vn, dc), 1, PRIOR_WIN),
             "Trainer_VD_Top3": self._rate(("tvd", r["_tr"], vn, dc), 2, PRIOR_TOP3),
-            "Sire_Cond_Top3": self._rate(("sc", r["_sire"], vn, dc, gc), 2, PRIOR_TOP3),
-            "DamSire_Cond_Top3": self._rate(("dm", r["_dam"], vn, dc, gc), 2, PRIOR_TOP3),
+            "Sire_Cond_Top3": self._rate(("sc", r["_sire"], vn, dc, gc), 2, PRIOR_TOP3), "DamSire_Cond_Top3": self._rate(("dm", r["_dam"], vn, dc, gc), 2, PRIOR_TOP3),
             "Course_Front_Rate": self._rate(("course", vn, r["_dist"], r["_tt"]), 1, PRIOR_FRONT),
-            "Class_Level": float(cl) if pd.notna(cl) else -1.0,
-            "Class_Change": float(cl - last["_cls"]) if pd.notna(cl) and last is not None and pd.notna(last["_cls"]) else 0.0,
-            "Field_Type": 0.0 if (pd.notna(fs) and fs <= 9) else (2.0 if (pd.notna(fs) and fs >= 16) else 1.0),
+            "Class_Level": float(cl) if pd.notna(cl) else -1.0, "Class_Change": float(cl - last["_cls"]) if pd.notna(cl) and last is not None and pd.notna(last["_cls"]) else 0.0,
+            "Dist_Cat": float(dc), "Field_Type": 0.0 if (pd.notna(fs) and fs <= 9) else (2.0 if (pd.notna(fs) and fs >= 16) else 1.0),
         }
         f.update(self._change_features(r, past, tac, last))
+        f.update(self._stamina_features(r, past))
+        f.update(self._prep_features(r, past))
+        f.update(self._balance_features(r, past))
         return f
 
 def add_pace_features(df, tac_col="Hist_Last_Tactics", race_col="Race_ID"):
@@ -357,7 +389,9 @@ def add_pace_features(df, tac_col="Hist_Last_Tactics", race_col="Race_ID"):
 # ⑥ メンバー内での相対評価：同一レースの出走馬どうしを比較（出走表が確定すれば予想時にも同じ値が作れる＝リークなし）
 #   *_Rel : メンバー平均との差 / *_Pct : メンバー内の相対順位（0に近いほど優秀、0.5=データなし）
 MEMBER_FEATURES = ["Mem_Last3F_Diff_Pct", "Mem_Last3F_Mean3_Rel", "Mem_Last_Margin_Rel", "Mem_Last_Margin_Pct",
-                   "Mem_Win_Rate_Rel", "Mem_Top3_Rate_Rel", "Mem_Top3_Rate_Pct", "Mem_Placing3_Rel", "Mem_Burden_Rel", "Mem_Dist_Top3_Rel"]
+                   "Mem_Win_Rate_Rel", "Mem_Top3_Rate_Rel", "Mem_Top3_Rate_Pct", "Mem_Placing3_Rel", "Mem_Burden_Rel", "Mem_Dist_Top3_Rel",
+                   # 展開・馬場の適性（レース内で全馬共通の値を、馬ごとの有利不利に変換）
+                   "Pace_Pressure", "Pace_Advantage", "Mem_Front_Rank", "Nige_Rivals", "Front_Rivals", "Going_Fit_Rel"]
 
 def add_member_relative_features(df, race_col="Race_ID"):
     def col(name): return pd.to_numeric(df[name], errors="coerce")
@@ -376,6 +410,33 @@ def add_member_relative_features(df, race_col="Race_ID"):
     rel("Mem_Placing3_Rel", "Hist_Mean_Placing3", started)
     rel("Mem_Burden_Rel", "Burden Weight", col("Burden Weight").notna())
     rel("Mem_Dist_Top3_Rel", "Hist_Dist_Top3", started)
+    rel("Going_Fit_Rel", "Going_Fit", started)                         # 今回の馬場への適性を、同じレースの他馬と比較
+    g = df[race_col]
+    cpv = col("Hist_CornerPos_Mean3").where(col("Hist_CornerPos_Mean3") >= 0)          # 序盤の位置取り(0=先頭〜1=後方)。判明している馬のみ
+    front = (cpv <= 0.25).astype(float).where(cpv.notna())
+    df["Pace_Pressure"] = front.groupby(g).transform("mean").fillna(0.3).astype(float)     # 場の『前に行きたい馬』の割合 = 想定ペースの速さ
+    df["Pace_Advantage"] = ((cpv - 0.5) * (df["Pace_Pressure"] - 0.30)).fillna(0.0).astype(float)   # +: 速い流れで後ろ寄り／遅い流れで前寄り＝展開が向く
+    df["Mem_Front_Rank"] = cpv.groupby(g).rank(method="average", pct=True).fillna(0.5).astype(float)   # 0に近いほどメンバー内で前に行く
+    nige = (col("Hist_Last_Tactics") == 1).astype(float)
+    df["Nige_Rivals"] = (nige.groupby(g).transform("sum") - nige).astype(float)               # 同じレースの他の逃げ馬の数（競り合い）
+    fr = front.fillna(0.0)
+    df["Front_Rivals"] = (fr.groupby(g).transform("sum") - fr).astype(float)                  # 同じレースの他の先行馬の数
+    return df
+
+# ⑧ 長距離の特別なレース（長距離専用モデルの対象）：菊花賞(3000m) / 天皇賞(春)(3200m) / 有馬記念(2500m)
+SPECIAL_RACES = {"Is_Kikkasho": r"菊花賞", "Is_TennoSho_Spring": r"天皇賞.{0,2}春", "Is_Arima": r"有馬記念"}
+SPECIAL_RACE_FEATURES = list(SPECIAL_RACES)
+SPECIAL_RACE_LABELS = {1: "菊花賞", 2: "天皇賞(春)", 3: "有馬記念"}
+
+def race_group_code(name):
+    s_ = unicodedata.normalize("NFKC", str(name))
+    for i, pat in enumerate(SPECIAL_RACES.values(), 1):
+        if re.search(pat, s_): return i
+    return 0
+
+def add_race_group_features(df):
+    nm = df["Race Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x))
+    for k, pat in SPECIAL_RACES.items(): df[k] = nm.str.contains(pat, regex=True).astype(float)
     return df
 # ======================= 共通特徴量コア ここまで =======================
 
@@ -863,7 +924,8 @@ def build_feature_rows(race: pd.DataFrame, hist: pd.DataFrame, ped: dict) -> pd.
     fb = get_builder(hist, day) if len(hist) else FeatureBuilder()
     feats = pd.DataFrame([fb.features(x) for x in p[INTERNAL_COLS].to_dict("records")])
     out = pd.concat([r.drop(columns=["Last 3F", "Tactics", "Placing_num"]), feats], axis=1)
-    return add_member_relative_features(add_pace_features(out))
+    out = add_member_relative_features(add_pace_features(out))
+    return add_race_group_features(out)
 
 
 # ============================================================
@@ -879,6 +941,24 @@ def load_model():
     return obj
 
 
+GOING_ORDINAL = {"良": 0, "稍重": 1, "稍": 1, "重": 2, "不良": 3, "不": 3}  # unknown/missing is kept separate as -1
+APP_BASE_FEATURES = ["Distance", "Bracket", "Horse Number", "Horse Age", "Burden Weight", "Track_Type", "Race Name", "Venue", "Track Condition", "Weather",
+                     "Horse Name", "Sex", "Jockey", "Trainer", "Sire", "Dam's Sire",
+                     "exp_count_nige", "exp_count_senko", "exp_count_sashi", "exp_count_oikomi", "exp_front_ratio", "field_size"]
+
+
+def app_generated_features() -> set:
+    """このアプリが生成できる特徴量名の全体。"""
+    return set(APP_BASE_FEATURES) | set(BUILDER_FEATURES) | set(MEMBER_FEATURES) | set(SPECIAL_RACE_FEATURES) | set(PREP_FEATURES)
+
+
+def missing_model_features(bundle) -> list:
+    """モデルが使う特徴量のうち、アプリで生成できないもの（学習コードとアプリの特徴量定義のずれ）。"""
+    if not bundle: return []
+    ok = app_generated_features()
+    return [f for f in bundle.get("features", []) if f not in ok]
+
+
 def rows_to_matrix(rows: pd.DataFrame, bundle: dict) -> pd.DataFrame:
     features = list(bundle["features"]); cat = set(bundle.get("categorical_features", []))
     enc = bundle.get("encoders", {}); nan_ok = set(bundle.get("nan_features", ["Bracket", "Horse Number"]))
@@ -890,12 +970,19 @@ def rows_to_matrix(rows: pd.DataFrame, bundle: dict) -> pd.DataFrame:
         if c in cat:
             X[c] = X[c].fillna("Unknown").astype(str).replace({"": "Unknown"}).map(enc.get(c, {})).fillna(-1).astype("int32")
         else:
-            v = pd.to_numeric(X[c], errors="coerce")
-            if c in ("Bracket", "Horse Number"):
-                v = v.where(v > 0)
-                X[c] = v.astype(float) if c in nan_ok else v.fillna(4.0 if c == "Bracket" else (len(X) + 1) / 2).astype(float)
+            if c == "Track Condition":
+                if not pd.api.types.is_numeric_dtype(X[c]):
+                    v = X[c].astype(str).str.strip().map(GOING_ORDINAL)
+                else:
+                    v = pd.to_numeric(X[c], errors="coerce")
+                X[c] = v.fillna(-1.0).astype(float)
             else:
-                X[c] = v.fillna(0).astype(float)
+                v = pd.to_numeric(X[c], errors="coerce")
+                if c in ("Bracket", "Horse Number"):
+                    v = v.where(v > 0)
+                    X[c] = v.astype(float) if c in nan_ok else v.fillna(4.0 if c == "Bracket" else (len(X) + 1) / 2).astype(float)
+                else:
+                    X[c] = v.fillna(0).astype(float)
     return X
 
 
@@ -909,6 +996,18 @@ def predict_race(bundle, feats: pd.DataFrame):
     win_n = win / max(win.sum(), 1e-9)
     k = min(3, n); top3_n = np.clip(top3 * (k / max(top3.sum(), 1e-9)), 0, 0.98)
     return win_n, top3_n
+
+
+def pick_model(bundle, race: pd.DataFrame, scope="target"):
+    """レースに応じて 長距離専用モデル / 汎用モデル を選ぶ。scope: target=菊花賞・天皇賞(春)・有馬記念のみ / all_long=2500m以上の平地すべて / off=使わない"""
+    sp = (bundle.get("specialists") or {}).get("long") if bundle else None
+    if not sp or scope == "off": return bundle, "汎用モデル"
+    r0 = race.iloc[0]; group = race_group_code(r0["Race Name"]); dist, tt = r0["Distance"], r0["Track_Type"]
+    long_flat = bool(pd.notna(dist) and dist >= sp.get("min_distance", 2500) and tt != 2)
+    if (scope == "target" and group > 0) or (scope == "all_long" and long_flat):
+        nm = SPECIAL_RACE_LABELS.get(group)
+        return sp, "長距離専用モデル" + (f"（{nm}）" if nm else "")
+    return bundle, "汎用モデル"
 
 
 def model_is_current(bundle) -> bool:
@@ -1178,6 +1277,187 @@ def race_label(rid: str, g: pd.DataFrame) -> str:
 
 
 # ============================================================
+# 過去予想の呼び出し ／ 当日条件の変更（シナリオ）予想
+#   ・変更できるもの: 馬場状態・天候・出走取消・枠番/馬番・騎手・斤量 → モデルへの入力そのものを変えて再推論
+#   ・ペース: モデルは『ペース』を入力に持たないため、履歴から求めた『ペース×脚質』の有利不利倍率で事後補正（脚質の想定は馬ごとに変更可）
+# ============================================================
+GOING_OPTIONS = ["良", "稍重", "重", "不良"]
+WEATHER_OPTIONS = ["晴", "曇", "小雨", "雨", "小雪", "雪"]
+PACE_NAMES = ["ハイペース", "ミドルペース", "スローペース"]
+PACE_CHOICES = ["自動（補正なし）"] + PACE_NAMES
+TAC_AUTO = "自動（前走）"
+TAC_CODE = {"逃げ": 1, "先行": 2, "差し": 3, "追込": 4}
+PACE_HIGH_PROB = {"ハイペース": 85.0, "ミドルペース": 50.0, "スローペース": 15.0}
+# 履歴が少ない場合の既定倍率（勝率・複勝率とも同じ。目安であり、実データから算出できる場合はそちらを優先）
+PACE_DEFAULT_LIFT = {"ハイペース": {1: 0.85, 2: 0.93, 3: 1.08, 4: 1.15},
+                     "ミドルペース": {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0},
+                     "スローペース": {1: 1.20, 2: 1.10, 3: 0.92, 4: 0.82}}
+
+
+def pace_tactic_lifts(hist: pd.DataFrame, min_races=300, shrink=200.0):
+    """履歴から『ペース(場の逃げ先行割合で3分類) × 脚質』ごとの 勝率・複勝率 の倍率（全体比）を算出。件数が少なければ既定値。"""
+    default = {"win": PACE_DEFAULT_LIFT, "top3": PACE_DEFAULT_LIFT, "source": "既定値（履歴が少ないため）"}
+    try:
+        if hist is None or len(hist) == 0: return default
+        h = hist[pd.to_numeric(hist["_tac"], errors="coerce").between(1, 4) & hist["_pl"].notna()].copy()
+        h["_front"] = (h["_tac"] <= 2).groupby(h["Race_ID"]).transform("mean")
+        h = h[h.groupby("Race_ID")["_tac"].transform("size") >= 8]
+        n_races = h["Race_ID"].nunique()
+        if n_races < min_races: return default
+        races = h.drop_duplicates("Race_ID")
+        hi, lo = races["_front"].quantile(0.7), races["_front"].quantile(0.3)
+        h["_pace"] = np.where(h["_front"] >= hi, "ハイペース", np.where(h["_front"] <= lo, "スローペース", "ミドルペース"))
+        out = {"source": f"履歴 {n_races:,}レースから算出（場の逃げ・先行割合で3分類）"}
+        for kind, cond in (("win", h["_pl"] == 1), ("top3", h["_pl"] <= 3)):
+            h["_y"] = cond.astype(float); overall = h.groupby("_tac")["_y"].mean(); out[kind] = {}
+            for p in PACE_NAMES:
+                agg = h[h["_pace"] == p].groupby("_tac")["_y"].agg(["sum", "count"])
+                out[kind][p] = {}
+                for t in (1, 2, 3, 4):
+                    if t in agg.index and overall.get(t, 0) > 0:
+                        rate = (agg.loc[t, "sum"] + shrink * overall[t]) / (agg.loc[t, "count"] + shrink)
+                        out[kind][p][t] = float(np.clip(rate / overall[t], 0.5, 1.8))
+                    else:
+                        out[kind][p][t] = 1.0
+        return out
+    except Exception:
+        return default
+
+
+def apply_pace_adjustment(win, top3, tactics, pace, lifts, strength=1.0):
+    """想定脚質(1〜4, 0=不明)に応じて 勝率・複勝率 を補正し、再び 合計=1 / 合計=min(3,頭数) に正規化。"""
+    lw = np.array([lifts["win"][pace].get(int(t), 1.0) for t in tactics], dtype=float) ** strength
+    l3 = np.array([lifts["top3"][pace].get(int(t), 1.0) for t in tactics], dtype=float) ** strength
+    w = np.asarray(win, dtype=float) * lw; w = w / max(w.sum(), 1e-9)
+    n = len(w); k = min(3, n)
+    t3 = np.clip(np.asarray(top3, dtype=float) * l3, 0, 0.98); t3 = np.clip(t3 * (k / max(t3.sum(), 1e-9)), 0, 0.98)
+    return w, t3
+
+
+def build_edit_table(race: pd.DataFrame) -> pd.DataFrame:
+    n = len(race)
+    return pd.DataFrame({"出走": [True] * n, "Horse Number": race["Horse Number"].astype("Int64").values, "Horse Name": race["Horse Name"].values,
+                         "Bracket": race["Bracket"].astype("Int64").values, "Jockey": race["Jockey"].values,
+                         "Burden Weight": race["Burden Weight"].values, "想定脚質": [TAC_AUTO] * n})
+
+
+def apply_overrides(race: pd.DataFrame, going=None, weather=None, edits: pd.DataFrame = None):
+    """当日変化しうる要素をレース行へ反映。戻り値: (変更後のレース, {馬名: 想定脚質コード})。"""
+    r = race.copy().reset_index(drop=True)
+    if going: r["Track Condition"] = going
+    if weather: r["Weather"] = weather
+    tac = {}
+    if edits is not None and len(edits):
+        e = edits.reset_index(drop=True)
+        if len(e) != len(r): raise ValueError("出走馬の編集表の行数がレースと一致しません。")
+        for col in ("Bracket", "Horse Number", "Burden Weight"): r[col] = pd.to_numeric(e[col], errors="coerce").values
+        r["Jockey"] = e["Jockey"].fillna("").astype(str).values
+        tac = {n: TAC_CODE[t] for n, t in zip(e["Horse Name"], e["想定脚質"]) if t in TAC_CODE}
+        r = r[e["出走"].fillna(True).astype(bool).values].reset_index(drop=True)
+    if len(r) < 2: raise ValueError("出走馬が2頭未満です。")
+    return r, tac
+
+
+def describe_scenario(orig: pd.DataFrame, new: pd.DataFrame, going, weather, pace_choice, tac_over) -> str:
+    parts = []
+    o = orig.iloc[0]
+    if going and going != o["Track Condition"]: parts.append(f"馬場:{going}")
+    if weather and weather != o["Weather"]: parts.append(f"天候:{weather}")
+    if pace_choice in PACE_NAMES: parts.append(pace_choice)
+    gone = set(orig["Horse Name"]) - set(new["Horse Name"])
+    if gone: parts.append(f"取消{len(gone)}頭")
+    m = orig.set_index("Horse Name"); nn = new.set_index("Horse Name"); common = [h for h in nn.index if h in m.index]
+    if any(str(m.loc[h, "Jockey"]) != str(nn.loc[h, "Jockey"]) for h in common): parts.append("騎手変更")
+    if any(not (pd.isna(m.loc[h, "Burden Weight"]) and pd.isna(nn.loc[h, "Burden Weight"])) and m.loc[h, "Burden Weight"] != nn.loc[h, "Burden Weight"] for h in common): parts.append("斤量変更")
+    if any(not (pd.isna(m.loc[h, "Horse Number"]) and pd.isna(nn.loc[h, "Horse Number"])) and (m.loc[h, "Horse Number"] != nn.loc[h, "Horse Number"] or m.loc[h, "Bracket"] != nn.loc[h, "Bracket"]) for h in common): parts.append("枠順変更")
+    if tac_over: parts.append(f"脚質想定{len(tac_over)}頭")
+    return "／".join(parts) or "基準（入力どおり）"
+
+
+def run_scenario(bundle, hist, ped, race, spec_scope="target", going=None, weather=None, edits=None, pace_choice=None, strength=1.0, lifts=None):
+    """条件を反映して推論。画面に依存しない（テスト可能）。"""
+    r, tac_over = apply_overrides(race, going, weather, edits)
+    label = describe_scenario(race, r, going, weather, pace_choice, tac_over)
+    feats = build_feature_rows(r, hist, ped)
+    use_bundle, model_label = pick_model(bundle, r, spec_scope)
+    win, top3 = predict_race(use_bundle, feats)
+    raw_win = win.copy()
+    tactics = pd.to_numeric(feats["Hist_Last_Tactics"], errors="coerce").where(lambda s: s.isin([1, 2, 3, 4]), 0).fillna(0).astype(int).values.copy()
+    for i, n in enumerate(feats["Horse Name"]):
+        if n in tac_over: tactics[i] = tac_over[n]                    # 想定脚質（ペース補正・展開分析にのみ使用。モデル入力は変えない）
+    adjusted = pace_choice in PACE_NAMES
+    if adjusted:
+        lifts = lifts or {"win": PACE_DEFAULT_LIFT, "top3": PACE_DEFAULT_LIFT, "source": "既定値"}
+        win, top3 = apply_pace_adjustment(win, top3, tactics, pace_choice, lifts, strength)
+    feats_view = feats.copy(); feats_view["Hist_Last_Tactics"] = tactics.astype(float)
+    view = pd.DataFrame({
+        "Horse Number": feats["Horse Number"], "Horse Name": feats["Horse Name"], "Bracket": feats["Bracket"], "Jockey": feats["Jockey"],
+        "勝率(%)": np.round(win * 100, 1), "複勝率(%)": np.round(top3 * 100, 1),
+        "前走脚質": feats["Hist_Last_Tactics"].map(lambda x: TACTICS_LABEL.get(int(x), "-") if x in (1, 2, 3, 4) else "-"),
+        "想定脚質": pd.Series(tactics).map(lambda x: TACTICS_LABEL.get(int(x), "-")).values,
+        "前走上がり3F": feats["Hist_Last3F_Last"].where(feats["Hist_Last3F_Last"] > 0),
+        "前走着差(相対着順)": feats["Rel_Last_Margin"].where(feats["Rel_Last_Margin"] >= 0).round(2),
+        "間隔(日)": feats["Hist_Rest_Days"].where(feats["Hist_Rest_Days"] >= 0)})
+    if adjusted: view["補正前勝率(%)"] = np.round(raw_win * 100, 1)
+    view["予想順位"] = view["勝率(%)"].rank(ascending=False, method="min").astype(int)
+    view = view.sort_values("予想順位").reset_index(drop=True)
+    pace = diagnose_pace(feats_view)
+    if adjusted:
+        pace = dict(pace); pace.update({"ok": True, "pace": pace_choice, "high_prob": PACE_HIGH_PROB[pace_choice], "user_override": True})
+        pace.setdefault("front_ratio", 0.0); pace.setdefault("course_front", 0.0)
+    bias = bracket_bias(hist, r, view)
+    return {"label": label, "race": r, "view": view, "feats": feats_view, "pace": pace, "bias": bias, "model_label": model_label,
+            "missing_features": missing_model_features(use_bundle),
+            "comments": race_commentary(pace, bias, view, feats_view), "pace_choice": pace_choice if adjusted else None,
+            "lift_source": (lifts or {}).get("source", "") if adjusted else "", "strength": strength, "saved": False}
+
+
+def compare_scenarios(scens: dict, base_label: str) -> pd.DataFrame:
+    """馬ごとに 各シナリオの勝率・順位 と 基準シナリオとの差 を並べる。"""
+    base = scens[base_label]["view"].set_index("Horse Name")
+    names = list(dict.fromkeys(h for s in scens.values() for h in s["view"]["Horse Name"]))
+    out = pd.DataFrame({"Horse Name": names})
+    out.insert(0, "Horse Number", [next((int(s["view"].set_index("Horse Name").loc[h, "Horse Number"]) for s in scens.values() if h in set(s["view"]["Horse Name"]) and pd.notna(s["view"].set_index("Horse Name").loc[h, "Horse Number"])), None) for h in names])
+    for lab, s in scens.items():
+        v = s["view"].set_index("Horse Name")
+        out[f"{lab}｜勝率(%)"] = out["Horse Name"].map(v["勝率(%)"]); out[f"{lab}｜順位"] = out["Horse Name"].map(v["予想順位"])
+        if lab != base_label: out[f"{lab}｜Δ勝率(vs基準)"] = (out[f"{lab}｜勝率(%)"] - out["Horse Name"].map(base["勝率(%)"])).round(1)
+    first = f"{base_label}｜順位"
+    return out.sort_values(first, na_position="last").reset_index(drop=True)
+
+
+def past_race_options(sh, q="") -> pd.DataFrame:
+    """過去に予想した（予想済み／結果登録済み）レースの一覧（新しい順）。q: 『10月25日』『菊花賞』などで絞り込み。"""
+    mg = load_race_management_df(sh, fresh=False)
+    mg = mg[mg["Status"].isin([STATUS_PREDICTED, STATUS_RESULT])].copy()
+    if mg.empty: return mg
+    if q.strip():
+        mg = filter_entries(mg, q)
+    mg["_label"] = mg["Race Day"].astype(str) + " " + mg["Venue"].astype(str) + " " + mg["Race Name"].astype(str) + "（" + mg["Status"].astype(str) + "）"
+    return mg.sort_values(["Race Day", "Race ID"], ascending=[False, True]).reset_index(drop=True)
+
+
+def load_past_race(sh, rid: str) -> pd.DataFrame:
+    """race_results（無ければ predictions）から、そのレースの行（AI予想・結果列を含む）を23列形式で取得。"""
+    for name, extra in ((RESULTS_SHEET, [c for c in RESULT_COLUMNS if c not in COLUMNS_23]), (PREDICTIONS_SHEET, [])):
+        raw = read_sheet_df(sh, name)
+        if raw.empty: continue
+        src = raw[race_ids_vec(raw) == rid]
+        if not src.empty:
+            return standardize_to_23cols(src, extra_cols=extra).sort_values("Horse Number").reset_index(drop=True)
+    return pd.DataFrame()
+
+
+def saved_prediction_view(r: pd.DataFrame) -> pd.DataFrame:
+    """保存済みの予想結果（AI_Probability / AI_Rank / Top3 Probability）と、結果があれば着順を一覧にする。"""
+    t3 = pd.to_numeric(r["Top3 Probability"], errors="coerce") if "Top3 Probability" in r.columns else pd.Series(np.nan, index=r.index)
+    out = pd.DataFrame({"予想順位": r["AI_Rank"], "Horse Number": r["Horse Number"], "Horse Name": r["Horse Name"], "勝率(%)": r["AI_Probability"],
+                        "複勝率(%)": t3, "結果(着順)": r["Placing"], "脚質(実績)": r["Tactics"].map(lambda x: TACTICS_LABEL.get(int(x), "-") if pd.notna(x) else "-")})
+    return out.sort_values("予想順位", na_position="last").reset_index(drop=True)
+
+
+
+# ============================================================
 # 画面
 # ============================================================
 st.title("🏇 競馬予想AI オールインワン（23列仕様）")
@@ -1209,152 +1489,243 @@ with st.sidebar:
         st.warning("model.pkl がありません。train_kaggle.py で学習して配置してください。")
     else:
         st.caption(f"期間 {bundle.get('date_min')}〜{bundle.get('date_max')} / {bundle.get('rows_total', 0):,}行 / 特徴量{len(bundle['features'])}個")
-        if model_is_current(bundle): st.success(f"特徴量バージョン一致（{FEATURE_VERSION}）")
-        else: st.warning(f"model.pkl は旧仕様（{bundle.get('feature_version', '不明')}）です。新特徴量は未使用のため、train_kaggle.py で再学習してください。")
+        _miss = missing_model_features(bundle)
+        _miss_sp = missing_model_features((bundle.get("specialists") or {}).get("long"))
+        if _miss or _miss_sp:
+            st.error(f"このモデルが使う特徴量のうち、アプリで生成できないものがあります: {sorted(set(_miss + _miss_sp))}。値0で代用して推論するため精度が落ちます。学習コードの特徴量定義とアプリ(app.py)を合わせてください。")
+        elif model_is_current(bundle): st.success(f"特徴量バージョン一致（{FEATURE_VERSION}）")
+        else: st.info(f"モデルの特徴量バージョン {bundle.get('feature_version', '不明')}（アプリ {FEATURE_VERSION}）。必要な特徴量はすべて生成できます。")
+        if "Track Condition" in bundle.get("numeric_features", []):
+            st.caption("馬場状態は数値（良0・稍重1・重2・不良3）で使用（推定。学習コードの定義と一致しているか要確認）")
     if st.button("🔄 履歴・血統を再読込", **STRETCH):
         get_hist(force=True); st.success("履歴を再読込しました")
+    _sp = (bundle.get("specialists") or {}).get("long") if bundle else None
+    if _sp:
+        _m = _sp.get("metrics", {})
+        st.caption(f"長距離専用モデル: あり（{_sp.get('min_distance', 2500)}m以上・学習{_m.get('rows_train', 0):,}行 / 検証AUC 単勝{_m.get('auc_win_spec', float('nan')):.3f}）")
     if "hist" in S: st.caption(f"履歴: {len(S['hist']):,}走 / 血統登録 {len(S.get('ped', {})):,}頭")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["① 予想実行・買い目", "② 予想 vs 実績検証", "③ CSV同期・データ入力", "④ レース管理", "⑤ 血統マスタ"])
 
 # ------------------------------------------------------------------ タブ1
+def get_lifts(hist):
+    key = len(hist)
+    if S.get("_lift_key") != key:
+        S["_lifts"] = pace_tactic_lifts(hist); S["_lift_key"] = key
+    return S["_lifts"]
+
+
 with tab1:
-    st.subheader("1. 出走表の読み込み")
+    S.setdefault("scen", {})
+    src_mode = st.radio("レースの呼び出し元", ["出走表から新規予想", "過去に予想したレースを呼び出す"], horizontal=True, key="t1_src")
     q = st.text_input("日付・レース名で絞り込み", placeholder="例: 10月25日 / 菊花賞 / 2026-10-25 中山", key="q_entry")
-    st.caption("出走表はタブ③で『手入力 / 貼り付け / CSVアップロード』して「出走表」タブへ保存してから、ここで読み込みます。")
-    if st.button("📥 出走表シートを読み込む（全レース）", type="primary"):
-        raw = read_sheet_df(sh, ENTRY_SHEET, fresh=True)
-        if raw.empty:
-            st.warning("出走表タブが空です。タブ③で出走表を手入力／貼り付け／CSV同期してください。")
+    race = None; rid = None; day = ""; label_txt = ""; is_past = False
+    if src_mode.startswith("出走表"):
+        st.subheader("1. 出走表の読み込み")
+        st.caption("出走表はタブ③で『手入力 / 貼り付け / CSVアップロード』して「出走表」タブへ保存してから、ここで読み込みます。")
+        if st.button("📥 出走表シートを読み込む（全レース）", type="primary"):
+            raw = read_sheet_df(sh, ENTRY_SHEET, fresh=True)
+            if raw.empty:
+                st.warning("出走表タブが空です。タブ③で出走表を手入力／貼り付け／CSV同期してください。")
+            else:
+                ent = standardize_to_23cols(raw)
+                ent = ent[ent["Horse Name"] != ""].copy(); ent["_rid"] = race_ids_vec(ent)
+                S["entries"] = ent
+                try: upsert_management(sh, race_items_from_df(ent, STATUS_UNPREDICTED))
+                except Exception as exc: st.warning(f"race_management への未予想登録に失敗: {exc}")
+                st.success(f"{ent['_rid'].nunique()}レース / {len(ent)}頭を読み込みました（新規レースは『未予想』で登録）")
+        ent = S["entries"]
+        if ent.empty:
+            st.info("出走表を読み込むとレース選択が表示されます。")
         else:
-            ent = standardize_to_23cols(raw)
-            ent = ent[ent["Horse Name"] != ""].copy(); ent["_rid"] = race_ids_vec(ent)
-            S["entries"] = ent
-            try: upsert_management(sh, race_items_from_df(ent, STATUS_UNPREDICTED))
-            except Exception as exc: st.warning(f"race_management への未予想登録に失敗: {exc}")
-            st.success(f"{ent['_rid'].nunique()}レース / {len(ent)}頭を読み込みました（新規レースは『未予想』で登録）")
-    ent = S["entries"]
-    if ent.empty:
-        st.info("出走表を読み込むとレース選択が表示されます。")
+            fe = filter_entries(ent, q)
+            if fe.empty:
+                st.warning("該当するレースがありません。")
+            else:
+                day = st.selectbox("日付", sorted(fe["Race Day"].unique()), key="sel_day")
+                fd = fe[fe["Race Day"] == day]
+                groups = {r_: g for r_, g in fd.groupby("_rid", sort=True)}
+                labels = {r_: race_label(r_, g) for r_, g in groups.items()}
+                rid = st.selectbox("レース", list(groups), format_func=lambda x: labels[x], key="sel_race")
+                race = groups[rid].sort_values("Horse Number").reset_index(drop=True); label_txt = labels[rid]
     else:
-        fe = filter_entries(ent, q)
-        if fe.empty:
-            st.warning("該当するレースがありません。")
+        is_past = True
+        st.subheader("1. 過去に予想したレースを選ぶ")
+        opts = past_race_options(sh, q)
+        if opts.empty:
+            st.info("予想済みのレースがありません（条件に合うレースが無い場合は、絞り込みを変えてください）。")
         else:
-            st.subheader("2. レース選択")
-            day = st.selectbox("日付", sorted(fe["Race Day"].unique()), key="sel_day")
-            fd = fe[fe["Race Day"] == day]
-            groups = {rid: g for rid, g in fd.groupby("_rid", sort=True)}
-            labels = {rid: race_label(rid, g) for rid, g in groups.items()}
-            rid = st.selectbox("レース", list(groups), format_func=lambda x: labels[x], key="sel_race")
-            race = groups[rid].sort_values("Horse Number").reset_index(drop=True)
-            pred_done = S["preds"].get(rid)
-            st.dataframe(race[["Bracket", "Horse Number", "Horse Name", "Sex", "Horse Age", "Burden Weight", "Jockey", "Trainer"]],
-                         hide_index=True, **STRETCH)
+            lab_map = dict(zip(opts["Race ID"], opts["_label"]))
+            rid = st.selectbox("レース", list(lab_map), format_func=lambda x: lab_map[x], key="sel_past")
+            saved = load_past_race(sh, rid)
+            if saved.empty:
+                st.warning("このレースの行が race_results / predictions にありません。")
+            else:
+                race = saved.copy(); day = str(race["Race Day"].iloc[0]); label_txt = lab_map[rid]
+                st.markdown("**保存済みの予想結果**")
+                st.dataframe(saved_prediction_view(saved), hide_index=True, **STRETCH)
+                r0 = saved.iloc[0]
+                bits = [f"{k}: {r0[k]}" for k in ("Pace", "High Pace Prob", "Front Ratio", "Predicted At") if k in saved.columns and str(r0.get(k, "")).strip() not in ("", "nan")]
+                if bits: st.caption("／".join(bits))
+                if saved["Placing"].notna().any():
+                    top = saved.sort_values("AI_Rank").iloc[0]
+                    st.caption(f"結果登録済み：AI本命は {top['Horse Name']}（結果 {int(top['Placing']) if pd.notna(top['Placing']) else '-'}着）")
+
+    if race is not None:
+        st.subheader("2. 当日条件の変更（シナリオ）")
+        st.caption("重馬場・天候・出走取消・枠順・騎手・斤量はモデルの入力を変えて再推論します。ペースはモデルの入力に無いため、履歴から求めた『ペース×脚質』の有利不利倍率で補正します（想定脚質は馬ごとに変更可）。")
+        r0 = race.iloc[0]
+        c1, c2, c3 = st.columns(3)
+        going_sel = c1.selectbox("馬場状態", [f"入力どおり（{r0['Track Condition'] or '不明'}）"] + GOING_OPTIONS, key=f"sc_{rid}_going")
+        weather_sel = c2.selectbox("天候", [f"入力どおり（{r0['Weather'] or '不明'}）"] + WEATHER_OPTIONS, key=f"sc_{rid}_weather")
+        pace_sel = c3.selectbox("ペース", PACE_CHOICES, key=f"sc_{rid}_pace")
+        strength = st.slider("ペース補正の強さ（1.0=履歴どおり／0=補正なし）", 0.0, 1.5, 1.0, 0.1, key=f"sc_{rid}_str", disabled=pace_sel not in PACE_NAMES)
+        lift_mode = st.radio("ペース補正の倍率", ["履歴から算出", "定石の既定値"], horizontal=True, key=f"sc_{rid}_liftmode", disabled=pace_sel not in PACE_NAMES,
+                             help="履歴から算出: 保存済みの過去成績で『場の逃げ・先行割合×脚質』ごとの勝率・複勝率の全体比を求めた値。件数が少ない場合は自動で既定値になります。")
+        if pace_sel in PACE_NAMES and "hist" in S:
+            lf = get_lifts(S["hist"]) if lift_mode.startswith("履歴") else {"win": PACE_DEFAULT_LIFT, "top3": PACE_DEFAULT_LIFT, "source": "定石の既定値"}
+            with st.expander(f"倍率表（{lf['source']}）"):
+                st.dataframe(pd.DataFrame({TACTICS_LABEL[t]: {f"{p_}": f"勝率×{lf['win'][p_][t]:.2f} / 複勝×{lf['top3'][p_][t]:.2f}" for p_ in PACE_NAMES} for t in (1, 2, 3, 4)}), **STRETCH)
+        going = None if going_sel.startswith("入力どおり") else going_sel
+        weather = None if weather_sel.startswith("入力どおり") else weather_sel
+        with st.expander("出走馬の編集（出走取消・枠順・騎手・斤量・想定脚質）"):
+            ed = st.data_editor(build_edit_table(race), hide_index=True, disabled=["Horse Name"], key=f"sc_{rid}_ed", **STRETCH,
+                                column_config={"出走": st.column_config.CheckboxColumn("出走", help="外すと出走取消として扱います"),
+                                               "想定脚質": st.column_config.SelectboxColumn("想定脚質", options=[TAC_AUTO] + list(TAC_CODE), help="ペース補正・展開分析にのみ使います"),
+                                               "Bracket": st.column_config.NumberColumn("枠", min_value=1, max_value=8, step=1),
+                                               "Horse Number": st.column_config.NumberColumn("馬番", min_value=1, max_value=18, step=1),
+                                               "Burden Weight": st.column_config.NumberColumn("斤量", step=0.5)})
+        spec_scope = "off"
+        if bundle and (bundle.get("specialists") or {}).get("long"):
+            sp_lab = st.radio("長距離専用モデルの適用範囲", ["菊花賞・天皇賞(春)・有馬記念のみ", "2500m以上の平地レースすべて", "使わない（汎用モデルのみ）"], horizontal=True, key="spec_scope")
+            spec_scope = {"菊": "target", "2": "all_long"}.get(sp_lab[0], "off")
+        clear_mode = "none"
+        if not is_past:
             c1, c2 = st.columns([1, 1])
             save_on = c1.checkbox("予想と同時に predictions / race_results / race_management へ保存", value=True)
             clear_label = c2.radio("出走表バッファのリセット", ["予想したレースの行を削除（他レースは残す）", "出走表タブを全消去"], horizontal=False)
             clear_mode = "race" if clear_label.startswith("予想") else "all"
-            if st.button("🔮 このレースを予想する", type="primary", disabled=bundle is None):
-                try:
-                    with st.spinner("履歴参照 → 特徴量生成 → 推論中…"):
-                        hist, ped = get_hist()
-                        feats = build_feature_rows(race, hist, ped)
-                        win, top3 = predict_race(bundle, feats)
-                        view = pd.DataFrame({
-                            "Horse Number": feats["Horse Number"], "Horse Name": feats["Horse Name"], "Bracket": feats["Bracket"],
-                            "Jockey": feats["Jockey"], "勝率(%)": np.round(win * 100, 1), "複勝率(%)": np.round(top3 * 100, 1),
-                            "前走脚質": feats["Hist_Last_Tactics"].map(lambda x: TACTICS_LABEL.get(int(x), "-") if x in (1, 2, 3, 4) else "-"),
-                            "前走上がり3F": feats["Hist_Last3F_Last"].where(feats["Hist_Last3F_Last"] > 0),
-                            "前走着差(相対着順)": feats["Rel_Last_Margin"].where(feats["Rel_Last_Margin"] >= 0).round(2),
-                            "間隔(日)": feats["Hist_Rest_Days"].where(feats["Hist_Rest_Days"] >= 0)})
-                        view["予想順位"] = view["勝率(%)"].rank(ascending=False, method="min").astype(int)
-                        view = view.sort_values("予想順位").reset_index(drop=True)
-                        pace = diagnose_pace(feats); bias = bracket_bias(hist, race, view)
-                        S["preds"][rid] = {"view": view, "feats": feats, "pace": pace, "bias": bias,
-                                           "comments": race_commentary(pace, bias, view, feats), "saved": False}
-                    if save_on:
-                        with st.spinner("スプレッドシートへ保存中（Upsert）…"):
-                            save_prediction(sh, rid, race, view, pace, dict(zip(view["Horse Name"], view["複勝率(%)"])), clear_mode)
-                        S["preds"][rid]["saved"] = True
-                        st.success("保存しました：predictions / race_results を更新、race_management を『予想済み』へ、出走表バッファをリセット")
-                except Exception as exc:
-                    st.error(f"予想に失敗しました: {exc}"); st.code(traceback.format_exc())
+        else:
+            save_on = st.checkbox("この結果で保存済みの予想を上書き保存する（predictions / race_results の AI予想列を更新）", value=False,
+                                  help="オフのままなら、画面上の試算のみでスプレッドシートは変更しません。")
+        b1, b2 = st.columns([3, 1])
+        if b1.button("🔮 この条件で予想する", type="primary", disabled=bundle is None, key=f"run_{rid}"):
+            try:
+                with st.spinner("履歴参照 → 条件反映 → 特徴量生成 → 推論中…"):
+                    hist, ped = get_hist()
+                    res = run_scenario(bundle, hist, ped, race, spec_scope, going, weather, ed, pace_sel if pace_sel in PACE_NAMES else None, strength,
+                                       get_lifts(hist) if lift_mode.startswith("履歴") else {"win": PACE_DEFAULT_LIFT, "top3": PACE_DEFAULT_LIFT, "source": "定石の既定値"})
+                    scen = S["scen"].setdefault(rid, {})
+                    lab = res["label"]; n_ = 2
+                    while lab in scen:                                       # 同名シナリオは連番で区別
+                        lab = f"{res['label']} #{n_}"; n_ += 1
+                    res["label"] = lab; scen[lab] = res; S[f"scen_sel_{rid}"] = lab
+                if save_on:
+                    with st.spinner("スプレッドシートへ保存中（Upsert）…"):
+                        save_prediction(sh, rid, res["race"], res["view"], res["pace"], dict(zip(res["view"]["Horse Name"], res["view"]["複勝率(%)"])), clear_mode)
+                    res["saved"] = True
+                    st.success("保存しました：predictions / race_results を更新、race_management を『予想済み』へ" + ("、出走表バッファをリセット" if clear_mode != "none" else ""))
+            except Exception as exc:
+                st.error(f"予想に失敗しました: {exc}"); st.code(traceback.format_exc())
+        if b2.button("🧹 条件をリセット", key=f"reset_{rid}", **STRETCH):
+            for k_ in [k for k in S.keys() if str(k).startswith(f"sc_{rid}_")]: del S[k_]
+            st.rerun()
 
-            P = S["preds"].get(rid)
-            if P:
-                st.subheader("3. AI予想結果")
-                refresh = st.button("🔄 オッズ更新（odds_master）")
-                with st.expander("💬 オッズ入力（ChatGPT等に問い合わせた結果の貼り付け／手入力）"):
-                    st.caption("① 下のプロンプトをAIに貼り付けて質問 → ② 返ってきたCSVを貼り付けて保存。AIの回答は誤りの可能性があるため、購入前にJRA公式等で必ず確認してください。")
-                    st.code(build_odds_prompt(day, labels[rid], race), language="text")
-                    pasted = st.text_area("AIの回答（馬番,単勝,複勝下限,複勝上限）", height=140, key=f"odds_paste_{rid}")
-                    if pasted.strip():
-                        pv = parse_odds_text(pasted); st.dataframe(pv, hide_index=True, **STRETCH)
-                        if st.button("💾 貼り付けたオッズを保存", key=f"odds_save_p_{rid}"):
-                            try:
-                                ig = save_odds(sh, rid, race, pv, "AI問い合わせ貼り付け"); refresh = True
-                                st.success("odds_master に保存しました" + (f"（出走表に無い馬番を無視: {ig}）" if ig else ""))
-                            except Exception as exc: st.error(str(exc))
-                    cur_o = load_odds(sh, rid)
-                    base = pd.DataFrame({"Horse Number": race["Horse Number"].astype("Int64"), "Horse Name": race["Horse Name"]})
-                    if not cur_o.empty:
-                        base = base.merge(cur_o[["Horse Number", "Win Odds", "Place Odds Min", "Place Odds Max"]].assign(**{"Horse Number": lambda x: x["Horse Number"].astype("Int64")}), on="Horse Number", how="left")
-                    for c in ("Win Odds", "Place Odds Min", "Place Odds Max"):
-                        if c not in base.columns: base[c] = np.nan
-                    st.caption("表で直接入力・修正もできます。")
-                    ed = st.data_editor(base, hide_index=True, disabled=["Horse Number", "Horse Name"], key=f"odds_ed_{rid}", **STRETCH)
-                    if st.button("💾 表のオッズを保存", key=f"odds_save_t_{rid}"):
+        scen = S["scen"].get(rid, {})
+        if scen:
+            labs = list(scen)
+            if S.get(f"scen_sel_{rid}") not in labs: S[f"scen_sel_{rid}"] = labs[-1]
+            st.subheader("3. AI予想結果")
+            sel = st.selectbox("表示するシナリオ", labs, key=f"scen_sel_{rid}")
+            P = scen[sel]
+            st.caption(f"使用モデル: {P.get('model_label', '汎用モデル')}" + (f"／ペース補正: {P['pace_choice']}（倍率の出典: {P['lift_source']}・強さ{P['strength']}）" if P.get("pace_choice") else "")
+                       + ("／保存済み" if P.get("saved") else "／未保存（画面上の試算）"))
+            if P.get("missing_features"):
+                st.warning(f"⚠ このモデルが使う特徴量のうち、アプリで生成できないものがあります: {P['missing_features']}（値0で代用して推論しているため精度が落ちます）。")
+            if len(labs) >= 2:
+                with st.expander(f"📊 シナリオ比較（{len(labs)}件）", expanded=True):
+                    base_lab = st.selectbox("基準にするシナリオ", labs, key=f"cmp_base_{rid}")
+                    cmp_df = compare_scenarios(scen, base_lab)
+                    st.dataframe(cmp_df, hide_index=True, **STRETCH)
+                    st.download_button("比較表CSV", to_csv_bytes(cmp_df), f"scenario_compare_{rid}.csv", "text/csv", key=f"cmp_dl_{rid}")
+                    d1, d2 = st.columns(2)
+                    if d1.button("🗑 表示中のシナリオを削除", key=f"del_{rid}"):
+                        del S["scen"][rid][sel]; st.rerun()
+                    if d2.button("🗑 全シナリオを削除", key=f"delall_{rid}"):
+                        S["scen"][rid] = {}; st.rerun()
+            P_race = P["race"]
+            refresh = st.button("🔄 オッズ更新（odds_master）")
+            with st.expander("💬 オッズ入力（ChatGPT等に問い合わせた結果の貼り付け／手入力）"):
+                st.caption("① 下のプロンプトをAIに貼り付けて質問 → ② 返ってきたCSVを貼り付けて保存。AIの回答は誤りの可能性があるため、購入前にJRA公式等で必ず確認してください。")
+                st.code(build_odds_prompt(day, label_txt, P_race), language="text")
+                pasted = st.text_area("AIの回答（馬番,単勝,複勝下限,複勝上限）", height=140, key=f"odds_paste_{rid}")
+                if pasted.strip():
+                    pv = parse_odds_text(pasted); st.dataframe(pv, hide_index=True, **STRETCH)
+                    if st.button("💾 貼り付けたオッズを保存", key=f"odds_save_p_{rid}"):
                         try:
-                            tv = ed.rename(columns={"Win Odds": "単勝", "Place Odds Min": "複勝下限", "Place Odds Max": "複勝上限"})
-                            tv = tv.dropna(subset=["単勝", "複勝下限", "複勝上限"], how="all")
-                            save_odds(sh, rid, race, tv[["Horse Number", "単勝", "複勝下限", "複勝上限"]], "手入力"); refresh = True
-                            st.success("odds_master に保存しました")
+                            ig = save_odds(sh, rid, P_race, pv, "AI問い合わせ貼り付け"); refresh = True
+                            st.success("odds_master に保存しました" + (f"（出走表に無い馬番を無視: {ig}）" if ig else ""))
                         except Exception as exc: st.error(str(exc))
-                odds = load_odds(sh, rid, fresh=refresh)
-                v = attach_odds(P["view"], odds)
-                S["preds"][rid]["view_odds"] = v
-                cols = ["予想順位", "Horse Number", "Horse Name", "勝率(%)", "複勝率(%)", "単勝オッズ", "人気", "期待値(単勝)", "期待値(複勝)",
-                        "前走脚質", "前走上がり3F", "前走着差(相対着順)", "間隔(日)"]
-                st.dataframe(v[cols], hide_index=True, **STRETCH)
-                if odds.empty: st.caption("odds_master にこのレースのオッズがありません。期待値は表示されません。")
-                else: st.caption("期待値 = 勝率 × 単勝オッズ（複勝は複勝率 × 複勝オッズ下限）。1.0超なら理論上プラス。オッズは学習に使わず、ここで動的結合しています。")
+                cur_o = load_odds(sh, rid)
+                base = pd.DataFrame({"Horse Number": P_race["Horse Number"].astype("Int64"), "Horse Name": P_race["Horse Name"]})
+                if not cur_o.empty:
+                    base = base.merge(cur_o.reindex(columns=["Horse Number", "Win Odds", "Place Odds Min", "Place Odds Max"]).assign(**{"Horse Number": lambda x: x["Horse Number"].astype("Int64")}), on="Horse Number", how="left")
+                for c in ("Win Odds", "Place Odds Min", "Place Odds Max"):
+                    if c not in base.columns: base[c] = np.nan
+                st.caption("表で直接入力・修正もできます。")
+                ed_o = st.data_editor(base, hide_index=True, disabled=["Horse Number", "Horse Name"], key=f"odds_ed_{rid}", **STRETCH)
+                if st.button("💾 表のオッズを保存", key=f"odds_save_t_{rid}"):
+                    try:
+                        tv = ed_o.rename(columns={"Win Odds": "単勝", "Place Odds Min": "複勝下限", "Place Odds Max": "複勝上限"})
+                        tv = tv.dropna(subset=["単勝", "複勝下限", "複勝上限"], how="all")
+                        save_odds(sh, rid, P_race, tv[["Horse Number", "単勝", "複勝下限", "複勝上限"]], "手入力"); refresh = True
+                        st.success("odds_master に保存しました")
+                    except Exception as exc: st.error(str(exc))
+            odds = load_odds(sh, rid, fresh=refresh)
+            v = attach_odds(P["view"], odds)
+            cols = ["予想順位", "Horse Number", "Horse Name", "勝率(%)"] + (["補正前勝率(%)"] if "補正前勝率(%)" in v.columns else []) + \
+                   ["複勝率(%)", "単勝オッズ", "人気", "期待値(単勝)", "期待値(複勝)", "前走脚質", "想定脚質", "前走上がり3F", "前走着差(相対着順)", "間隔(日)"]
+            st.dataframe(v[[c for c in cols if c in v.columns]], hide_index=True, **STRETCH)
+            if odds.empty: st.caption("odds_master にこのレースのオッズがありません。期待値は表示されません。")
+            else: st.caption("期待値 = 勝率 × 単勝オッズ（複勝は複勝率 × 複勝オッズ下限）。1.0超なら理論上プラス。オッズは学習に使わず、ここで動的結合しています。")
 
-                st.subheader("4. 詳細レース考察")
-                pc = P["pace"]
-                if pc.get("ok"):
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("想定ペース", pc["pace"]); m2.metric("ハイペース確率", f"{pc['high_prob']}%")
-                    m3.metric("逃げ・先行割合", f"{pc['front_ratio']}%"); m4.metric("コース前残り率", f"{pc['course_front']}%")
-                st.bar_chart(pd.DataFrame({"頭数": [pc["n_nige"], pc["n_senko"], pc["n_sashi"], pc["n_oikomi"], pc["n_unknown"]]},
-                                          index=["逃げ", "先行", "差し", "追込", "不明"]))
-                for line in P["comments"]: st.markdown(line)
-                b = P["bias"]
-                if b.get("table") is not None:
-                    st.caption("同コース過去成績の枠別（内/中/外）"); st.dataframe(b["table"], **STRETCH)
-                if b.get("ai") is not None:
-                    st.caption("今回のAI予測：枠別の平均勝率"); st.dataframe(b["ai"], **STRETCH)
+            st.subheader("4. 詳細レース考察")
+            pc = P["pace"]
+            if pc.get("ok"):
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("想定ペース" + ("（指定）" if pc.get("user_override") else ""), pc["pace"]); m2.metric("ハイペース確率", f"{pc['high_prob']}%")
+                m3.metric("逃げ・先行割合", f"{pc.get('front_ratio', 0)}%"); m4.metric("コース前残り率", f"{pc.get('course_front', 0)}%")
+            st.bar_chart(pd.DataFrame({"頭数": [pc.get("n_nige", 0), pc.get("n_senko", 0), pc.get("n_sashi", 0), pc.get("n_oikomi", 0), pc.get("n_unknown", 0)]},
+                                      index=["逃げ", "先行", "差し", "追込", "不明"]))
+            for line in P["comments"]: st.markdown(line)
+            b = P["bias"]
+            if b.get("table") is not None:
+                st.caption("同コース過去成績の枠別（内/中/外）"); st.dataframe(b["table"], **STRETCH)
+            if b.get("ai") is not None:
+                st.caption("今回のAI予測：枠別の平均勝率"); st.dataframe(b["ai"], **STRETCH)
 
-                st.subheader("5. 買い目自動算出")
-                bc1, bc2 = st.columns(2)
-                budget = bc1.number_input("予算（円）", min_value=100, step=100, value=3000, key=f"budget_{rid}")
-                strat = bc2.selectbox("戦略", ["的中・堅実重視", "回収率・バリュー重視"], key=f"strat_{rid}")
-                if st.button("🧠 買い目を自動算出する", key=f"bet_{rid}", type="primary"):
-                    S["bets"][rid] = make_bets(v, int(budget), strat) + (int(budget), strat)
-                if rid in S["bets"]:
-                    bets, note, bud, st_name = S["bets"][rid]
-                    if note: st.warning(note)
-                    if not bets: st.info("買い目を作成できませんでした。")
-                    else:
-                        for bt in bets:
-                            with st.container(border=True):
-                                a, b_, c, d_ = st.columns([3, 1.4, 1.2, 1.6])
-                                a.markdown(f"**{bt['種別']}　{bt['馬番']}番 {bt['馬名']}**")
-                                b_.metric("金額", f"{bt['金額']:,}円"); c.metric("オッズ", f"{bt['オッズ']:.1f}倍")
-                                d_.metric("的中確率 / 期待払戻", f"{bt['的中確率(%)']}% / {bt['期待払戻']:,}円")
-                        tot = sum(x["金額"] for x in bets); er = sum(x["期待払戻"] for x in bets)
-                        st.success(f"合計 {tot:,}円（予算 {bud:,}円・{st_name}）／ 期待払戻 約{er:,}円（期待回収率 {er / tot * 100:.0f}%）")
-                        st.caption("対象は odds_master にある単勝・複勝のみ。確率はAI推定で的中を保証するものではありません。馬券は自己責任で。")
+            st.subheader("5. 買い目自動算出")
+            bkey = (rid, sel)
+            bc1, bc2 = st.columns(2)
+            budget = bc1.number_input("予算（円）", min_value=100, step=100, value=3000, key=f"budget_{rid}")
+            strat = bc2.selectbox("戦略", ["的中・堅実重視", "回収率・バリュー重視"], key=f"strat_{rid}")
+            if st.button("🧠 買い目を自動算出する", key=f"bet_{rid}", type="primary"):
+                S["bets"][bkey] = make_bets(v, int(budget), strat) + (int(budget), strat)
+            if bkey in S["bets"]:
+                bets, note, bud, st_name = S["bets"][bkey]
+                if note: st.warning(note)
+                if not bets: st.info("買い目を作成できませんでした。")
+                else:
+                    for bt in bets:
+                        with st.container(border=True):
+                            a, b_, c, d_ = st.columns([3, 1.4, 1.2, 1.6])
+                            a.markdown(f"**{bt['種別']}　{bt['馬番']}番 {bt['馬名']}**")
+                            b_.metric("金額", f"{bt['金額']:,}円"); c.metric("オッズ", f"{bt['オッズ']:.1f}倍")
+                            d_.metric("的中確率 / 期待払戻", f"{bt['的中確率(%)']}% / {bt['期待払戻']:,}円")
+                    tot = sum(x["金額"] for x in bets); er = sum(x["期待払戻"] for x in bets)
+                    st.success(f"合計 {tot:,}円（予算 {bud:,}円・{st_name}・シナリオ: {sel}）／ 期待払戻 約{er:,}円（期待回収率 {er / tot * 100:.0f}%）")
+                    st.caption("対象は odds_master にある単勝・複勝のみ。確率はAI推定で的中を保証するものではありません。馬券は自己責任で。")
+
 
 # ------------------------------------------------------------------ タブ2
 with tab2:
